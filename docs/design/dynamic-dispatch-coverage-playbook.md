@@ -193,7 +193,7 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 | PHP | Drupal | request → *.routing.yml → _controller/_form | R | ✅ **`claimsReference` for FQCN handlers** (`\Drupal\…\Class::method` passed the pre-filter only because the `::method` name was known; bare `_form` FQCNs `\…\FormClass` and single-colon `Class:method` controller-services were dropped before resolve()) + **single-colon controller match** + **detect via composer `type:drupal-*` / `name:drupal/*` + `*.info.yml` fallback** (a contrib module with empty `require` was undetected → 0 routes). admin_toolbar S **0→14 (14/14)** / webform M 208 (**144**) / core L 836 (536→**731, 87%**). Remainder is the **entity-annotation handler frontier** (`_entity_form: type.op` resolves via the entity's PHP `#[ContentEntityType]` handlers, not a direct class). 🔬 **OOP `#[Hook]` attributes** — Drupal 11 moved ~all procedural hooks to attribute methods (core: 418 `#[Hook]` files vs 3 procedural), so the resolver's docblock/`module_hook` detection is obsolete for modern core (0 hook edges) |
 | C/C++ | (callback structs / vtables) | function-pointer dispatch | ? | ⬜ |
 | Dart | Flutter | setState → build; build → child widgets | S + X | ✅ **setState→build synthesizer** (Dart analog of react-render: a State method whose body calls `setState(` → `build`) gated to `.dart` + **foundational Dart method-range fix** — Dart models a method body as a *sibling* of the signature, so method nodes were signature-only (`end==start`); now `endLine` spans the body (required for ALL body analysis: callees, context slices, the synthesizer's body scan). counter `initState→build`, books `build→BookDetail/BookForm`; widget composition already static (compass_app `build→ErrorIndicator/HomeButton`). Controls unchanged (excalidraw 9,290 / django 302 — the range fix only extends sibling-body grammars). 🔬 MVVM Command/ChangeNotifier dispatch (compass_app — no setState) + `Navigator.push(MaterialPageRoute(builder:))` nav routes |
-| Lua / Luau | (Neovim / Roblox) | event/callback dispatch | S | ⬜ |
+| Lua / Luau | Neovim / Roblox | module dispatch (require→mod, mod.fn); event/callback | — | ✅ **already covered for the dominant flow (measure-first, no code change)** — Neovim is module-heavy (`require('x')` + `x.fn()`), and the general import + name resolution already handles it: telescope.nvim **220 imports + 335 cross-file `mod.fn` calls**, traces end-to-end (`map_entries ← init.lua → get_current_picker (state.lua)`). Luau instance-path `require(game:GetService(...))` handled by the extractor. 🔬 event-callback registration (`vim.keymap.set(…, fn)`, autocmd `callback=`, Roblox `signal:Connect(fn)`) is predominantly INLINE anonymous closures (corpus ~12 inline vs ~2 named) — the anonymous-handler frontier; named handlers too rare to justify a synthesizer |
 | Scala | (Akka / Play) | actor message → handler | ? | ⬜ |
 
 (Verify the exact supported set against `src/extraction/languages/` and
@@ -462,6 +462,20 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
   Ktor `routing { get("/x") { … } }` inline-lambda handlers (anonymous,
   no named target), Compose recomposition (implicit — reading `mutableStateOf` triggers recompose, no
   `setState`-style gate to anchor a synthesizer), and coroutines/Flow dispatch.
+- **Lua / Luau (validated 2026-05-23, telescope.nvim / lualine.nvim / Knit — measure-first, already covered).**
+  The matrix guessed "event/callback dispatch (synthesizer)", but measurement says otherwise: real Neovim
+  plugins are MODULE-dispatch-heavy (`local m = require('telescope.actions'); m.fn()`), and codegraph's general
+  `require`-import + cross-file name resolution already handles it — telescope.nvim has **220 resolved imports
+  and 335 cross-file `module.fn` call edges**, and a flow traces end-to-end (`map_entries ← init.lua →
+  get_current_picker` in actions/state.lua). The Luau extractor already handles Roblox instance-path requires
+  (`require(game:GetService("ReplicatedStorage").Packages.Knit)`). **The assumed hole isn't real** — like
+  Svelte/NestJS. The genuine frontier is event-callback registration (`vim.keymap.set(mode, lhs, fn)`, autocmd
+  `{callback=fn}`, Roblox `signal:Connect(fn)`), but it's predominantly INLINE anonymous closures (corpus: ~12
+  inline `:Connect(function…)` vs ~2 named), and telescope's keymaps are inline functions or vim-command
+  STRINGS, not named refs. A named-only callback synthesizer would cover a tiny fraction, so per "measure before
+  building / partial coverage is worse than none", none was built — no code change; recorded as validated.
+  Agent A/B (actions.utils map flow, n=2/arm): codegraph **0 read / 0 grep / 18–24s** vs without **1 read
+  (+glob) / 24–25s** — small flow so modest, but the 0-read confirms the module dispatch is navigable.
 - **Difficulty gradient is real:** named-ref dispatch (resolver) is cheap; anonymous
   callback dispatch (synthesizer) is medium; **anonymous-arrow handlers are the hard
   remaining gap** (no identity → need synthesizer link-through-body, not yet built).
