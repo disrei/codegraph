@@ -372,7 +372,7 @@ otherwise closed but a Fabric flow still breaks.
 | JavaScript × native | React Native TurboModules | spec interface ↔ impl | R (spec as ground truth) | ✅ partial — name-match path lands (§8b) |
 | Objective-C/Java/Kotlin → JavaScript | React Native event emitters | `[self sendEventWithName:]` → `addListener` | S (cross-lang channel) | ✅ Phase 3 (§8e) |
 | JavaScript × Swift/Kotlin | Expo Modules | `requireNativeModule('X').fn(...)` → `Function("fn") { }` | R (extract synthesizes method nodes) | ✅ Phase 4 (§8f) |
-| JavaScript × native | React Native Fabric views | `<MyView p=v/>` → `RCT_EXPORT_VIEW_PROPERTY` / Codegen view spec | R + JSX | ⬜ Phase 6 (defer) |
+| JavaScript × native | React Native Fabric views | `<MyView p=v/>` → Codegen spec component + NativeProps | R (extract) + S (native-impl) + JSX | ✅ Phase 6 (§8g) |
 
 ### 8a. Phase 1 measurements — Swift ↔ ObjC
 
@@ -459,6 +459,56 @@ Five tests cover the extractor + an end-to-end fixture:
 `JS callsite of literal AsyncFunction("uniqueExpoHapticCall") resolves
 to the native impl node` — confirms the resolver-free bridge path
 works when names aren't shadowed.
+
+### 8g. Phase 6 measurements — Fabric / Codegen view components
+
+Two-part design:
+
+1. **Framework extractor** (`src/resolution/frameworks/fabric.ts`) — parses
+   TS / TSX spec files for `codegenNativeComponent<Props>('Name', ...)`
+   declarations. Emits:
+   - One `component` node per declaration (named after the JS-visible
+     component name; matches the JSX synthesizer's name+kind filter).
+   - One `property` node per declared field of the `NativeProps`
+     interface — surfacing JSX-callable props like `onTap`,
+     `nativeContainerBackgroundColor` as discoverable graph nodes.
+
+2. **Synthesizer** (`fabricNativeImplEdges` in `callback-synthesizer.ts`) —
+   walks every `fabric-component:*` node and looks for a native class
+   matching its name with one of RN's convention suffixes (empty / `View`
+   / `ViewManager` / `ComponentView` / `Manager`). Emits a `calls` edge
+   with `metadata.synthesizedBy:'fabric-native-impl'` from the component
+   to each match. The convention is precise enough that there's no name
+   collision in well-formed RN libraries.
+
+Combined with the existing `reactJsxChildEdges` JSX synthesizer, this
+closes the full JSX → native flow: consumer-app JSX `<MyView prop=v/>`
+→ Fabric `component` node `MyView` → native class `MyViewView`
+(or `MyViewManager` / `MyViewComponentView` / …).
+
+Re-validated on **react-native-screens** (the corpus repo that was
+entirely Fabric and showed 0 bridges in Phase 2):
+
+| Metric | Count |
+|---|---|
+| `codegenNativeComponent` spec declarations | 54 |
+| Fabric component nodes extracted | 27 (one per non-web spec; the `*.web.ts` variants are filtered out by spec validity) |
+| Fabric prop nodes extracted | 272 (the full NativeProps interface surface across all components) |
+| `fabric-native-impl` bridge edges | 68 |
+
+Sample bridge edges:
+
+| JS component | Native class | Suffix |
+|---|---|---|
+| `RNSFullWindowOverlay` | `RNSFullWindowOverlay` (ObjC) | (exact) |
+| `RNSFullWindowOverlay` | `RNSFullWindowOverlayManager` (ObjC) | `Manager` |
+| `RNSModalScreen` | `RNSModalScreenManager` (ObjC) | `Manager` |
+| `RNSScreenContainer` | `RNSScreenContainerView` (ObjC) | `View` |
+
+Four tests cover the extractor + a full end-to-end fixture
+(`App (TSX) → MyView (fabric-component) → MyViewView (ObjC class)`)
+that asserts the JSX→component edge AND the
+component→native-class edge both exist after indexing.
 
 ---
 

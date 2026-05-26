@@ -670,10 +670,82 @@ function rnEventEdges(ctx: ResolutionContext): Edge[] {
 }
 
 /**
+ * Phase 6 — React Native Fabric/Codegen view component bridge.
+ *
+ * The Fabric framework extractor (`frameworks/fabric.ts`) emits
+ * `component` nodes named after the JS-visible component (e.g.
+ * `RNSScreenStack`) from each `codegenNativeComponent<Props>('Name')`
+ * spec declaration. The native implementation lives in an ObjC++/.mm or
+ * Kotlin/Java class whose name follows one of RN's conventions:
+ *
+ *   - Exact: `RNSScreenStack`
+ *   - With suffix: `RNSScreenStackView`, `RNSScreenStackViewManager`,
+ *     `RNSScreenStackComponentView`, `RNSScreenStackManager`
+ *
+ * This synthesizer walks every Fabric component node and looks for a
+ * native class matching one of those names; when found, emits a
+ * `calls` edge `component → native class` (provenance `'heuristic'`,
+ * `synthesizedBy:'fabric-native-impl'`) so trace from JSX usage of the
+ * component continues into native.
+ *
+ * The convention-based suffix lookup is precise: there's no name
+ * collision in RN view-manager codebases by design (Codegen output would
+ * conflict otherwise).
+ */
+const FABRIC_NATIVE_SUFFIXES = ['', 'View', 'ViewManager', 'ComponentView', 'Manager'];
+
+function fabricNativeImplEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  // The Fabric extractor IDs are prefixed `fabric-component:` so we can
+  // filter to just those without iterating all `component` nodes.
+  const components = ctx.getNodesByKind('component').filter((n) => n.id.startsWith('fabric-component:'));
+  if (components.length === 0) return edges;
+
+  // Pre-index native classes by name for O(1) lookup.
+  const nativeClassesByName = new Map<string, Node[]>();
+  for (const n of ctx.getNodesByKind('class')) {
+    if (n.language !== 'objc' && n.language !== 'kotlin' && n.language !== 'java' && n.language !== 'cpp') continue;
+    const arr = nativeClassesByName.get(n.name);
+    if (arr) arr.push(n);
+    else nativeClassesByName.set(n.name, [n]);
+  }
+
+  for (const component of components) {
+    for (const suffix of FABRIC_NATIVE_SUFFIXES) {
+      const candidate = component.name + suffix;
+      const matches = nativeClassesByName.get(candidate);
+      if (!matches || matches.length === 0) continue;
+      // Link the component node to every matching native class (iOS +
+      // Android each have one).
+      for (const native of matches) {
+        const key = `${component.id}>${native.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: component.id,
+          target: native.id,
+          kind: 'calls',
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'fabric-native-impl',
+            viaSuffix: suffix || '(exact)',
+            componentName: component.name,
+          },
+        });
+      }
+    }
+  }
+
+  return edges;
+}
+
+/**
  * Synthesize dispatcher→callback edges (field observers + EventEmitters +
- * React re-render + JSX children + Vue templates + RN event channel).
- * Returns the count added. Never throws into indexing — callers wrap in
- * try/catch.
+ * React re-render + JSX children + Vue templates + RN event channel +
+ * Fabric native-impl). Returns the count added. Never throws into
+ * indexing — callers wrap in try/catch.
  */
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
   const fieldEdges = fieldChannelEdges(queries, ctx);
@@ -685,6 +757,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const cppEdges = cppOverrideEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
   const rnEventEdgesList = rnEventEdges(ctx);
+  const fabricNativeEdges = fabricNativeImplEdges(ctx);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -698,6 +771,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...cppEdges,
     ...ifaceEdges,
     ...rnEventEdgesList,
+    ...fabricNativeEdges,
   ]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;

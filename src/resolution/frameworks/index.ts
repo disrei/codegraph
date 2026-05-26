@@ -24,6 +24,7 @@ import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
+import { fabricViewResolver } from './fabric';
 
 /**
  * All registered framework resolvers
@@ -63,6 +64,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   reactNativeBridgeResolver,
   // Expo Modules — Function/AsyncFunction/Property DSL on Swift/Kotlin
   expoModulesResolver,
+  // React Native Fabric / Codegen view components — TS spec → component nodes
+  fabricViewResolver,
 ];
 
 /**
@@ -136,3 +139,4 @@ export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver } from './expo-modules';
+export { fabricViewResolver } from './fabric';
