@@ -1057,13 +1057,101 @@ export class ToolHandler {
       ? '\n\n⚠️ **Ask user:** UX preferences, edge cases, acceptance criteria'
       : '';
 
+    // Auto-trace for flow queries: when the task is asking "how does X
+    // reach/flow/propagate from A to B", run the trace internally and
+    // append its body to the context response. Saves the agent the
+    // follow-up codegraph_trace call that was the #2 cost driver on
+    // multi-module flow questions (Q3 / etcd Q2 in the audit).
+    const flowTrace = await this.maybeInlineFlowTrace(task, cg);
+
     // buildContext returns string when format is 'markdown'
     if (typeof context === 'string') {
-      return this.textResult(this.truncateOutput(context + reminder));
+      return this.textResult(this.truncateOutput(context + flowTrace + reminder));
     }
 
     // If it returns TaskContext, format it
-    return this.textResult(this.truncateOutput(this.formatTaskContext(context) + reminder));
+    return this.textResult(this.truncateOutput(this.formatTaskContext(context) + flowTrace + reminder));
+  }
+
+  /**
+   * Detect a flow-style task ("how does X reach Y", "trace the path from A to B")
+   * and pre-run trace between the most likely endpoints, returning the trace
+   * body to splice into the context response. Returns '' for non-flow queries
+   * or when no plausible endpoint pair can be extracted.
+   *
+   * Conservative by design: only fires when the task has both a clear flow
+   * keyword AND at least two distinct PascalCase / camelCase identifiers.
+   * False positives waste a graph query; false negatives just fall back to
+   * the agent calling trace itself (existing path-proximity wiring handles
+   * disambiguation either way).
+   */
+  private async maybeInlineFlowTrace(task: string, cg: CodeGraph): Promise<string> {
+    const lower = task.toLowerCase();
+    const FLOW_KEYWORDS = [
+      'trace ',
+      'from ',
+      'reach ',
+      'flow ',
+      'propagat',
+      'how does ',
+      'how do ',
+    ];
+    if (!FLOW_KEYWORDS.some((k) => lower.includes(k))) return '';
+
+    // Extract candidate symbols — PascalCase or camelCase identifiers ≥3 chars.
+    // Filter out common non-symbol words and the flow keywords themselves.
+    const STOP_WORDS = new Set([
+      'how', 'does', 'the', 'and', 'from', 'through', 'reach', 'reaches',
+      'flow', 'path', 'trace', 'cross', 'module', 'modules', 'where',
+      'update', 'updates', 'updated', 'when', 'what', 'this', 'that',
+    ]);
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    const re = /\b([A-Z][a-z]+(?:[A-Z][a-z]*)+|[a-z]+[A-Z][a-z]*(?:[A-Z][a-z]*)*)\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(task)) !== null) {
+      const sym = m[1]!;
+      if (sym.length < 3) continue;
+      const key = sym.toLowerCase();
+      if (STOP_WORDS.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      ids.push(sym);
+    }
+    if (ids.length < 2) return '';
+
+    // The first two distinct symbols, in order of appearance, are the most
+    // likely from/to endpoints — "from X ... through to Y" naturally places
+    // them in that order in the prose. If the trace fails to connect, it
+    // still returns the inlined endpoint bodies (the trace-failure rewrite).
+    const fromSym = ids[0]!;
+    const toSym = ids[1]!;
+
+    let traceResult: ToolResult;
+    try {
+      traceResult = await this.handleTrace({
+        from: fromSym,
+        to: toSym,
+        projectPath: cg.getProjectRoot(),
+      } as Record<string, unknown>);
+    } catch {
+      return '';
+    }
+    // Extract the textual body. Defensive: handleTrace's contract is the
+    // standard tool-result shape used elsewhere in this file.
+    const body = traceResult.content
+      ?.map((c) => (c.type === 'text' ? c.text : ''))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (!body) return '';
+    return [
+      '',
+      '## Inline flow trace',
+      '',
+      `Auto-traced \`${fromSym}\` → \`${toSym}\` because the query looks like a flow question. No follow-up codegraph_trace is needed for this pair.`,
+      '',
+      body,
+    ].join('\n');
   }
 
   /**
