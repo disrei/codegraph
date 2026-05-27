@@ -681,6 +681,13 @@ export class ToolHandler {
       // The 5 omitted tools (callers, callees, impact, status, files) are
       // available on bigger projects where their value is clearer; on a
       // tiny repo their use cases reduce to one grep anyway.
+      //
+      // Note: tried cutting to 3 tools (search/context/trace only) on a
+      // micro tier — REGRESSED cost on cobra/ky/sinatra. Without
+      // codegraph_node and codegraph_explore the agent falls back to
+      // raw Reads, adding more cache-creation than the tool defs saved.
+      // 5 tools is the empirical lower bound that doesn't push the
+      // agent to Read on the typical small-repo flow.
       const TINY_REPO_FILE_THRESHOLD = 150;
       const TINY_REPO_CORE_TOOLS = new Set([
         'codegraph_search',
