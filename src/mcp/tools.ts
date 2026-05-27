@@ -383,7 +383,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_context',
-    description: 'PRIMARY TOOL — call this FIRST for any "how does X work", architecture, feature, or bug-context question. Composes search + node + callers + callees and returns entry points, related symbols, and key code in ONE call — usually enough to answer with no further search/Read/Grep. Prefer this over chaining codegraph_search + codegraph_node, and over codegraph_explore. NOTE: provides CODE context, not product requirements; for new features still clarify UX/edge cases with the user.',
+    description: 'PRIMARY TOOL — call FIRST for any "how does X work"/architecture/bug question. Returns entry points + related symbols + key code in one call; usually answers without further search/Read/Grep. Provides CODE context, not product requirements.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -408,7 +408,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_callers',
-    description: 'Find all functions/methods that call a specific symbol. Useful for understanding usage patterns and impact of changes.',
+    description: 'List functions that call <symbol>. For deep flow use codegraph_trace.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -428,7 +428,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_callees',
-    description: 'Find all functions/methods that a specific symbol calls. Useful for understanding dependencies and code flow.',
+    description: 'List functions that <symbol> calls. For deep flow use codegraph_trace.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -448,7 +448,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_impact',
-    description: 'Analyze the impact radius of changing a symbol. Shows what code could be affected by modifications.',
+    description: 'List symbols affected by changing <symbol>. Use before a refactor.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -468,7 +468,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_node',
-    description: 'Get ONE symbol\'s details (location, signature, docstring) PLUS its TRAIL — what it calls and what calls it, each with file:line. Pass includeCode=true for source (functions return their body; containers return a member outline). Use this to WALK the call graph hop-by-hop — node a symbol, then node one of its trail entries — the structural, no-Read way to follow "what calls/triggers/handles X" across files. For a broad first overview of many symbols at once use codegraph_explore; use node to drill along a specific path from there. (If a trail is empty on a non-leaf, that hop is likely dynamic dispatch — read just that line.) Source returned with includeCode is the verbatim live file content — identical to Read.',
+    description: 'One symbol\'s location, signature, callers/callees trail. includeCode=true returns the verbatim body. Use codegraph_trace for full paths instead of chaining nodes.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -488,7 +488,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_explore',
-    description: 'Returns source for SEVERAL related symbols grouped by file, plus a relationship map, in ONE capped call. This is the efficient way to inspect many related symbols at once — strongly prefer it over a series of codegraph_node or Read calls (each separate call re-reads the whole context, so 8 node calls cost far more than 1 explore). Use it after codegraph_context when you need to see the actual source of several symbols. Query with specific symbol/file/code terms, NOT natural-language sentences — run codegraph_search first to find names. Bad: "how are agent prompts loaded and passed to the CLI". Good: "renderStaticScene drawElementOnCanvas ShapeCache renderElement.ts". The code it returns is the VERBATIM live file source (byte-for-byte identical to Read), line-numbered — not a summary; treat files it shows as already Read, no need to re-open them.',
+    description: 'Source of SEVERAL related symbols grouped by file, in one capped call. Query is a bag of symbol/file names (not a question). Returned source is verbatim Read-equivalent — do not re-open shown files. Prefer over chained codegraph_node.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -508,7 +508,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_status',
-    description: 'Get the status of the CodeGraph index, including statistics about indexed files, nodes, and edges.',
+    description: 'Index health check (files / nodes / edges). Skip unless debugging.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -518,7 +518,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_files',
-    description: 'REQUIRED for file/folder exploration. Get the project file structure from the CodeGraph index. Returns a tree view of all indexed files with metadata (language, symbol count). Much faster than Glob/filesystem scanning. Use this FIRST when exploring project structure, finding files, or understanding codebase organization.',
+    description: 'Indexed file tree with language + symbol counts. Faster than Glob for project layout.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -551,7 +551,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_trace',
-    description: 'Trace the CALL PATH between two symbols — "how does <from> reach/become <to>?" Returns the chain of functions from one to the other (each hop with file:line and its body inlined, plus the outgoing calls of the destination itself) in ONE call. This is something grep/Read structurally cannot do: there is no text pattern for "the path from A to B". Ideal for flow questions — how an update triggers a render, how a request reaches a handler, how a QuerySet becomes SQL. If no static path exists the chain likely breaks at dynamic dispatch (callbacks/descriptors/metaclasses); the tool says where and points you to codegraph_node to bridge it.',
+    description: 'Call path between two symbols — "how does <from> reach <to>?" Returns the chain with each hop\'s body inlined plus the destination\'s callees, in ONE call. Ideal for flow questions (update→render, request→handler, QuerySet→SQL). If no static path exists the chain broke at dynamic dispatch — the failure response inlines both endpoints + their TO-file siblings.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -643,7 +643,7 @@ export class ToolHandler {
    */
   getTools(): ToolDefinition[] {
     const allow = this.toolAllowlist();
-    const visible = allow
+    let visible = allow
       ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
       : tools;
     if (!this.cg) return visible;
@@ -651,6 +651,27 @@ export class ToolHandler {
     try {
       const stats = this.cg.getStats();
       const budget = getExploreBudget(stats.fileCount);
+
+      // Tiny-repo tool gating: on projects under TINY_REPO_FILE_THRESHOLD
+      // files, only expose the 5 core tools (search, context, node,
+      // explore, trace). The agent's grep+read path is so cheap on a
+      // sub-150-file repo that the cache-creation overhead of 10 MCP tool
+      // definitions in the system prompt — ~$0.10-0.15 of fixed cost per
+      // question — can exceed the structural savings codegraph delivers.
+      // The 5 omitted tools (callers, callees, impact, status, files) are
+      // available on bigger projects where their value is clearer; on a
+      // tiny repo their use cases reduce to one grep anyway.
+      const TINY_REPO_FILE_THRESHOLD = 150;
+      const TINY_REPO_CORE_TOOLS = new Set([
+        'codegraph_search',
+        'codegraph_context',
+        'codegraph_node',
+        'codegraph_explore',
+        'codegraph_trace',
+      ]);
+      if (stats.fileCount < TINY_REPO_FILE_THRESHOLD) {
+        visible = visible.filter(t => TINY_REPO_CORE_TOOLS.has(t.name));
+      }
 
       return visible.map(tool => {
         if (tool.name === 'codegraph_explore') {
