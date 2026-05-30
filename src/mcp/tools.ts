@@ -2542,9 +2542,15 @@ export class ToolHandler {
         if (skel.length > 0) {
           const names = [...new Set(group.nodes.filter(n => n.kind !== 'import' && n.kind !== 'export').map(n => n.name))]
             .slice(0, budget.maxSymbolsInFileHeader).join(', ');
+          // Steer the agent to codegraph_explore for an elided body — NEVER to
+          // Read. The old "Read for more" / "Read for a full body" tags invited
+          // a Read of the very file just skeletonized; on a central, wanted file
+          // (Session.swift, DataRequest.swift) that fired an over-investigation
+          // spiral (the agent Read the skeletonized file, then kept digging).
+          // CLAUDE.md: explore output must never tell the agent to Read.
           const tag = bodyIds.size > 0
-            ? 'focused (the methods you named in full, the rest as signatures; Read for more)'
-            : 'skeleton (signatures only; Read for a full body)';
+            ? 'focused (the methods you named in full, the rest as signatures — codegraph_explore a signature by name for its body; do NOT Read)'
+            : 'skeleton (signatures only — codegraph_explore a name for its full body; do NOT Read)';
           lines.push(`#### ${filePath} — ${names} · ${tag}`, '', '```' + lang, skel.join('\n'), '```', '');
           totalChars += skel.join('\n').length + 120;
           filesIncluded++;
