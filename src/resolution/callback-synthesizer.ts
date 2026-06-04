@@ -444,8 +444,68 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
 // and are added below; their concrete-side nodes can be a `struct` (Swift)
 // or an `object` (Scala) so the loop also iterates those kinds.
 const IFACE_OVERRIDE_LANGS = new Set([
-  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala',
+  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go',
 ]);
+/**
+ * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
+ * struct satisfies an interface structurally when its method set covers the
+ * interface's. Synthesize the missing `implements` edge (struct → interface) by
+ * matching method-NAME sets, so impl-navigation works and the interface-dispatch
+ * bridge ({@link interfaceOverrideEdges}, now 'go'-enabled) can link an interface
+ * method call to the concrete overrides.
+ *
+ * Name-only matching (signatures ignored) — over-approximation accepted, in line
+ * with the other dispatch synthesizers; capped per interface. Empty interfaces
+ * (`any`) are skipped so they don't match every struct.
+ */
+function goImplementsEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  const methodNameSet = (id: string): Set<string> =>
+    new Set(
+      queries
+        .getOutgoingEdges(id, ['contains'])
+        .map((e) => queries.getNodeById(e.target))
+        .filter((n): n is Node => !!n && n.kind === 'method')
+        .map((n) => n.name),
+    );
+
+  const goStructs = queries.getNodesByKind('struct').filter((s) => s.language === 'go');
+  const structMethods = new Map<string, Set<string>>();
+  for (const s of goStructs) structMethods.set(s.id, methodNameSet(s.id));
+
+  for (const iface of queries.getNodesByKind('interface')) {
+    if (iface.language !== 'go') continue;
+    const want = methodNameSet(iface.id);
+    if (want.size === 0) continue; // empty interface (`any`) — would match everything
+    let added = 0;
+    for (const s of goStructs) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      const have = structMethods.get(s.id);
+      if (!have || have.size < want.size) continue;
+      let all = true;
+      for (const m of want) {
+        if (!have.has(m)) { all = false; break; }
+      }
+      if (!all) continue;
+      const key = `${s.id}>${iface.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: s.id,
+        target: iface.id,
+        kind: 'implements',
+        line: s.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'go-implements', via: iface.name, registeredAt: `${s.filePath}:${s.startLine}` },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
 function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -1190,6 +1250,13 @@ function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext):
  * count added. Never throws into indexing — callers wrap in try/catch.
  */
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
+  // Go implicit `implements` edges must be synthesized AND persisted first: the
+  // interface-dispatch bridge below reads `implements` edges from the DB, and
+  // Go has none statically. (Other languages already have static implements
+  // edges from extraction, so they don't need this pre-pass.)
+  const goImpl = goImplementsEdges(queries);
+  if (goImpl.length > 0) queries.insertEdges(goImpl);
+
   const fieldEdges = fieldChannelEdges(queries, ctx);
   const closureCollEdges = closureCollectionEdges(queries, ctx);
   const emitterEdges = eventEmitterEdges(ctx);
@@ -1229,5 +1296,5 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     merged.push(e);
   }
   if (merged.length > 0) queries.insertEdges(merged);
-  return merged.length;
+  return merged.length + goImpl.length;
 }

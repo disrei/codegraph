@@ -237,6 +237,54 @@ interface MethodForm {
     expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
   });
 
+  it('extracts type references from in-body local variable annotations', () => {
+    // A function that uses a type ONLY in its body — `const items: Foo[] = []` —
+    // still depends on Foo. The body walker used to capture calls but never type
+    // annotations, so impact / `affected` missed the dependency. Must cover
+    // function, class-method, and object-literal-method bodies — and must NOT
+    // turn the locals themselves into graph nodes (that would explode the graph).
+    const code = `
+import { Foo } from './types';
+
+export function build(): void {
+  const items: Foo[] = [];
+  void items;
+}
+
+export class K {
+  run(): void {
+    const a: Foo = { x: 1 };
+    void a;
+  }
+}
+
+export const handler = {
+  handle(): void {
+    const b: Foo = { x: 1 };
+    void b;
+  },
+};
+`;
+    const result = extractFromSource('inbody.ts', code);
+
+    const fooRefs = result.unresolvedReferences.filter(
+      (r) => r.referenceKind === 'references' && r.referenceName === 'Foo'
+    );
+    // One per body scope: build(), K.run(), handler.handle().
+    expect(fooRefs.length).toBeGreaterThanOrEqual(3);
+
+    // Each reference is attributed to its enclosing function/method node — never
+    // to a local-variable node, because locals are intentionally not extracted.
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    for (const ref of fooRefs) {
+      const owner = byId.get(ref.fromNodeId);
+      expect(owner).toBeDefined();
+      expect(['function', 'method']).toContain(owner!.kind);
+    }
+    // The locals (items/a/b) must not leak in as symbols.
+    expect(result.nodes.some((n) => ['items', 'a', 'b'].includes(n.name))).toBe(false);
+  });
+
   it('should track function calls', () => {
     const code = `
 function main() {
@@ -4457,5 +4505,276 @@ func (s Stack[T]) Len() int { return len(s.items) }
     expect(ts.nodes.find((n) => n.name === 'hello' && n.kind === 'function')).toBeDefined();
     const js = extractFromSource('service.xsjs', 'function handleRequest() { return 1; }');
     expect(js.nodes.find((n) => n.name === 'handleRequest' && n.kind === 'function')).toBeDefined();
+  });
+});
+
+describe('Import / re-export dependency linking (blast-radius recall)', () => {
+  // An import IS a dependency, but extraction only emits references for calls,
+  // instantiations, type annotations, and inheritance — so a symbol imported and
+  // then merely re-exported, placed in a registry array, passed as an argument,
+  // or used in JSX produced no cross-file edge, leaving the providing file with a
+  // false "0 dependents". These tests pin the import/re-export binding linking.
+  it('emits an imports reference per named, aliased, and default import binding', () => {
+    const code = `
+import { widget, helper as h } from './foo';
+import Thing from './thing';
+import * as NS from './ns';
+export const registry = [widget];
+`;
+    const result = extractFromSource('bar.ts', code);
+    const names = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    expect(names).toContain('widget');   // named import → local name
+    expect(names).toContain('h');        // aliased import → local alias
+    expect(names).toContain('Thing');    // default import
+    expect(names).toContain('NS');       // namespace import → linked to the module file as a dependency
+  });
+
+  it('emits an imports reference per re-exported binding', () => {
+    const result = extractFromSource('barrel.ts', `export { alpha, beta as b } from './source';`);
+    const names = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    // Re-export links the SOURCE-side name, not the local alias.
+    expect(names).toContain('alpha');
+    expect(names).toContain('beta');
+  });
+
+  it('a value imported/re-exported but never called still makes the importer a dependent', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'src', 'foo.ts'),
+        `export const widget = { n: 1 };\nexport function helper(): void {}\n`
+      );
+      // bar uses widget ONLY in an array and re-exports helper — neither is
+      // called/typed, so before import-linking bar had no edge to foo at all.
+      fs.writeFileSync(
+        path.join(dir, 'src', 'bar.ts'),
+        `import { widget } from './foo';\nexport { helper } from './foo';\nexport const registry = [widget];\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/foo.ts')).toContain('src/bar.ts');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('a namespace import touched only via a value-member read still links the module file', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'foo.ts'), `export const SOME_CONST = 42;\n`);
+      // `foo` is imported as a namespace and used ONLY via a value-member read
+      // (no call, no type) — `foo.helper()` would link on its own, but a bare
+      // `foo.SOME_CONST` would not, so the module-import backstop must link it.
+      fs.writeFileSync(path.join(dir, 'src', 'bar.ts'), `import * as foo from './foo';\nexport const x = foo.SOME_CONST;\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/foo.ts')).toContain('src/bar.ts');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('Python import dependency linking (blast-radius recall)', () => {
+  // Same recall gap as TS: Python only linked called/instantiated imports, so a
+  // name brought in with `from module import X` and then merely stored, used as
+  // a decorator/argument, or re-exported through an `__init__.py` produced no
+  // cross-file edge — the providing module showed a false "0 dependents".
+  it('emits an imports reference per name in a `from module import ...` (incl. value/aliased)', () => {
+    const code = [
+      'from foo import helper, widget',
+      'from foo import Thing as T',
+      'from . import sibling',
+      'from bar import *',
+    ].join('\n');
+    const names = extractFromSource('mod.py', code)
+      .unresolvedReferences.filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    expect(names).toContain('helper');
+    expect(names).toContain('widget');   // value import
+    expect(names).toContain('T');        // aliased import → local name
+    expect(names).toContain('sibling');  // `from . import <name>`
+    expect(names).not.toContain('*');    // wildcard import has no names
+  });
+
+  it('a Python value imported but never called still makes the importer a dependent', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'pkg', 'foo.py'), `widget = {"n": 1}\ndef helper():\n    return 1\n`);
+      // bar imports widget+helper but only stores widget in a list — nothing is
+      // called, so before import-linking bar had no edge to foo.
+      fs.writeFileSync(path.join(dir, 'pkg', 'bar.py'), `from foo import widget, helper\nregistry = [widget]\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('pkg/foo.py')).toContain('pkg/bar.py');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('resolves `from . import submodule` + `submodule.func()` to the submodule', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'pkg', '__init__.py'), '');
+      fs.writeFileSync(path.join(dir, 'pkg', 'certs.py'), `def where():\n    return "/ca.pem"\n`);
+      // certs is an imported MODULE (a file), and certs.where() is a qualified
+      // call through it — the receiver isn't a symbol, so plain name-matching
+      // can't link it. Also exercises the Python relative-dot path fix (`.certs`).
+      fs.writeFileSync(path.join(dir, 'pkg', 'utils.py'), `from . import certs\ndef go():\n    return certs.where()\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('pkg/certs.py')).toContain('pkg/utils.py');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('a module import is a dependency even when the used member is re-exported elsewhere', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'pkg', '__init__.py'), '');
+      // `where` is NOT defined in certs.py (re-exported from a 3rd-party pkg), so
+      // member resolution can't find it — the module-import backstop must still
+      // record utils -> certs. (Mirrors requests' real `certs.where`.)
+      fs.writeFileSync(path.join(dir, 'pkg', 'certs.py'), `from external_ca import where\n`);
+      fs.writeFileSync(path.join(dir, 'pkg', 'utils.py'), `from . import certs\nCA = certs.where()\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('pkg/certs.py')).toContain('pkg/utils.py');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('Go cross-package composite literals (blast-radius recall)', () => {
+  // Go function calls and type references across packages already resolved, but
+  // struct composite literals — `render.XML{...}` / `pkga.Widget{...}` — were not
+  // extracted at all, so a package whose types are only INSTANTIATED elsewhere
+  // (gin's render/binding implementations) showed 0 dependents.
+  it('links a cross-package struct composite literal to the defining package', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.mkdirSync(path.join(dir, 'render'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'render', 'xml.go'), `package render\n\ntype XML struct { Data any }\n`);
+      fs.writeFileSync(path.join(dir, 'app.go'), `package main\n\nimport "example.com/proj/render"\n\nfunc handle() any { return render.XML{} }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('render/xml.go')).toContain('app.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('links a composite literal in a package-level var registry', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.mkdirSync(path.join(dir, 'render'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'render', 'xml.go'), `package render\n\ntype XML struct {}\nfunc (XML) Render() {}\n`);
+      // The implementation is registered only in a top-level `var registry = {...}`
+      // map literal — the body walker doesn't cover top-level declarations, so this
+      // exercises the var-initializer walking added for Go.
+      fs.writeFileSync(path.join(dir, 'reg.go'), `package main\n\nimport "example.com/proj/render"\n\ntype R interface { Render() }\n\nvar registry = map[string]R{ "xml": render.XML{} }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('render/xml.go')).toContain('reg.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('links a parenthesized pointer type conversion `(*T)(x)` to the type', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.writeFileSync(path.join(dir, 'types.go'), `package main\n\ntype Wrapped struct { N int }\n`);
+      // `(*Wrapped)(x)` parses as a call whose callee is the parenthesized type
+      // `(*Wrapped)` — without normalization it dropped on the floor.
+      fs.writeFileSync(path.join(dir, 'use.go'), `package main\n\nfunc run(x *int) { _ = (*Wrapped)(x) }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('types.go')).toContain('use.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('links an implementation reached only through a Go interface (implicit satisfaction, #584)', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.mkdirSync(path.join(dir, 'codec'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'codec', 'api.go'), `package codec\n\ntype Core interface {\n\tMarshal(v any) ([]byte, error)\n}\n\nvar API Core\n`);
+      // jsonApi satisfies Core structurally (no `implements` keyword) and is
+      // reached ONLY through the interface (API.Marshal). Without implicit
+      // interface satisfaction + dispatch, json.go shows 0 dependents.
+      fs.writeFileSync(path.join(dir, 'codec', 'json.go'), `package codec\n\ntype jsonApi struct{}\n\nfunc (j jsonApi) Marshal(v any) ([]byte, error) { return nil, nil }\n\nfunc init() { API = jsonApi{} }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('codec/json.go')).toContain('codec/api.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('C# records (blast-radius recall)', () => {
+  // Records are ubiquitous in modern C# (DTOs, value objects, CQRS messages),
+  // but `record` / `record struct` declarations weren't extracted as types — so
+  // every reference, generic-type-argument, and `new` of a record dropped on the
+  // floor and the defining file showed 0 dependents. (#237)
+  it('extracts a record as a graph node (record class + record struct)', () => {
+    const r = extractFromSource('r.cs', `namespace P;\npublic record Box(int N);\npublic record struct Pt(int X);\n`);
+    expect(r.nodes.find((n) => n.name === 'Box' && (n.kind === 'class' || n.kind === 'struct'))).toBeDefined();
+    expect(r.nodes.find((n) => n.name === 'Pt' && (n.kind === 'class' || n.kind === 'struct'))).toBeDefined();
+  });
+
+  it('resolves references / instantiations of a record across files', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'types.cs'), `namespace P;\npublic record Box(int N);\n`);
+      // Box is used as a generic type argument and instantiated — both require
+      // Box to be a node to resolve.
+      fs.writeFileSync(
+        path.join(dir, 'use.cs'),
+        `using System.Collections.Generic;\nnamespace P;\npublic class User {\n    public IEnumerable<Box> Boxes { get; }\n    public Box Make() => new Box(1);\n}\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.cs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('types.cs')).toContain('use.cs');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
   });
 });

@@ -124,6 +124,7 @@ const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
   'new_expression',                  // typescript / javascript / tsx / jsx
   'object_creation_expression',      // java / c#
   'instance_creation_expression',    // some grammars
+  'composite_literal',               // go — `Widget{...}` / `pkga.Widget{...}`
 ]);
 
 /**
@@ -377,6 +378,22 @@ export class TreeSitterExtractor {
     // Check for imports
     else if (this.extractor.importTypes.includes(nodeType)) {
       this.extractImport(node);
+    }
+    // Re-export from another module — `export { X } from './y'` (TS/JS). A
+    // re-export is a dependency on the source module just like an import, but
+    // the export_statement is otherwise only descended into (no declaration to
+    // extract), so a barrel that ONLY re-exports produced zero edges and showed
+    // 0 dependents. Link each re-exported name to its definition. Children are
+    // still visited (a non-re-export `export const X = …` has no `source` and
+    // falls through to its normal declaration extraction).
+    else if (
+      nodeType === 'export_statement' &&
+      (this.language === 'typescript' || this.language === 'tsx' ||
+       this.language === 'javascript' || this.language === 'jsx') &&
+      getChildByField(node, 'source')
+    ) {
+      const parentId = this.nodeStack[this.nodeStack.length - 1];
+      if (parentId) this.emitReExportRefs(node, parentId);
     }
     // Check for function calls
     else if (this.extractor.callTypes.includes(nodeType)) {
@@ -1349,6 +1366,13 @@ export class TreeSitterExtractor {
             signature: initSignature,
           });
         }
+        // Walk the initializer so composite literals and calls in a
+        // package-level `var Query Binding = queryBinding{}` (a registry of
+        // implementations) or `var c = pkg.New()` are extracted as
+        // instantiates/calls dependencies — the body walker only covers
+        // initializers inside functions, not these top-level declarations.
+        const valueField = getChildByField(spec, 'value');
+        if (valueField) this.visitFunctionBody(valueField, '');
       }
 
       // Handle short_var_declaration (:=)
@@ -1485,6 +1509,13 @@ export class TreeSitterExtractor {
       // Extract interface inheritance from the inner type node
       const typeChild = getChildByField(node, 'type');
       if (typeChild) this.extractInheritance(typeChild, interfaceNode.id);
+      // Go: extract the interface's method specs as `method` nodes so implicit
+      // interface satisfaction (a struct's method set ⊇ the interface's) and
+      // impl-navigation can see the contract. Go has no `implements` keyword, so
+      // without the interface's method set there's nothing to match against.
+      if (this.language === 'go' && typeChild) {
+        this.extractGoInterfaceMethods(typeChild, interfaceNode.id);
+      }
       return true;
     }
 
@@ -1510,6 +1541,30 @@ export class TreeSitterExtractor {
       }
     }
     return false;
+  }
+
+  /**
+   * Extract the method specs of a Go `interface_type` body as `method` nodes
+   * contained by the interface (e.g. `Marshal`, `Unmarshal` of a `Core`
+   * interface). tree-sitter-go names these `method_elem` (newer) or
+   * `method_spec` (older). Embedded interfaces (`Reader` inside `ReadWriter`)
+   * are `type_identifier`s, not methods, and are left to inheritance extraction.
+   */
+  private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string): void {
+    this.nodeStack.push(ifaceId);
+    for (let i = 0; i < interfaceType.namedChildCount; i++) {
+      const m = interfaceType.namedChild(i);
+      if (!m || (m.type !== 'method_elem' && m.type !== 'method_spec')) continue;
+      const nameNode = getChildByField(m, 'name') ?? m.namedChild(0);
+      if (!nameNode) continue;
+      const mname = getNodeText(nameNode, this.source);
+      if (mname) {
+        this.createNode('method', mname, m, {
+          signature: this.extractor?.getSignature?.(m, this.source),
+        });
+      }
+    }
+    this.nodeStack.pop();
   }
 
   /**
@@ -1620,6 +1675,23 @@ export class TreeSitterExtractor {
             });
           }
         }
+        // Link each imported binding to its definition so imported-but-not-
+        // called/typed symbols still record a cross-file dependency (TS/JS only).
+        if (
+          this.language === 'typescript' || this.language === 'tsx' ||
+          this.language === 'javascript' || this.language === 'jsx'
+        ) {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) this.emitImportBindingRefs(node, parentId);
+        }
+        // Python `from module import X, Y` — link each imported name to its
+        // definition (covers `__init__.py` re-export barrels, which are just
+        // `from .sub import X`). Same recall gap as TS: a name imported and
+        // used in a non-call position created no dependency edge.
+        if (this.language === 'python' && node.type === 'import_from_statement') {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) this.emitPyFromImportRefs(node, parentId);
+        }
         return;
       }
       // Hook returned null — fall through to multi-import inline handlers only
@@ -1720,6 +1792,134 @@ export class TreeSitterExtractor {
     this.createNode('import', importText, node, {
       signature: importText,
     });
+  }
+
+  /**
+   * Emit one `imports` reference per named/default import binding (TS/JS family),
+   * attributed to the file node — so the resolver links each imported symbol to
+   * the file that DEFINES it.
+   *
+   * Importing a symbol IS a dependency, but extraction only emits references for
+   * calls, instantiations, type annotations, and inheritance. A symbol that's
+   * imported and then only re-exported (`export { X } from './x'`), placed in a
+   * registry array (`[expressResolver, …]`), passed as an argument, or used in
+   * JSX produced NO cross-file edge at all — so the providing file showed a
+   * false "0 dependents" and was invisible to blast-radius / `affected`. The
+   * resolver maps the local name (alias-aware) to the provider's definition and
+   * creates a cross-file `imports` edge; `getFileDependents` picks it up, while
+   * `getImpactRadius` keeps it as a bounded leaf (the importing file node).
+   *
+   * Namespace imports (`import * as NS`) bind a whole module: `NS.member` calls
+   * resolve on their own, but a namespace used ONLY via a value-member read
+   * (`NS.SOME_CONST`) would leave no edge — so we also emit the namespace local
+   * name, which the resolver links to the module FILE as a dependency backstop.
+   */
+  private emitImportBindingRefs(node: SyntaxNode, fromNodeId: string): void {
+    const clause = node.namedChildren.find((c) => c.type === 'import_clause');
+    if (!clause) return; // side-effect import (`import './x'`) — no bindings
+
+    const pushRef = (nameNode: SyntaxNode | null | undefined): void => {
+      if (!nameNode) return;
+      const name = getNodeText(nameNode, this.source);
+      if (!name) return;
+      this.unresolvedReferences.push({
+        fromNodeId,
+        referenceName: name,
+        referenceKind: 'imports',
+        line: nameNode.startPosition.row + 1,
+        column: nameNode.startPosition.column,
+      });
+    };
+
+    for (const child of clause.namedChildren) {
+      if (child.type === 'identifier') {
+        // default import: `import Foo from './x'`
+        pushRef(child);
+      } else if (child.type === 'named_imports') {
+        // `import { A, B as C } from './x'` — link the LOCAL name (alias if any)
+        for (const spec of child.namedChildren) {
+          if (spec.type !== 'import_specifier') continue;
+          pushRef(getChildByField(spec, 'alias') ?? getChildByField(spec, 'name') ?? spec.namedChild(0));
+        }
+      } else if (child.type === 'namespace_import') {
+        // `import * as NS from './x'` — emit NS so the module-import backstop can
+        // record the file dependency even if NS is only used by value-member read.
+        pushRef(child.namedChildren.find((c) => c.type === 'identifier') ?? child.namedChild(0));
+      }
+    }
+  }
+
+  /**
+   * Emit one `imports` reference per re-exported binding of a
+   * `export { A, B as C } from './y'` statement, attributed to the file node —
+   * so a barrel that re-exports from another module records a dependency on it.
+   *
+   * Links the SOURCE-side name (`A`, the `name` field — not the local alias
+   * `C`), since that is what the source module defines. `export * from './y'`
+   * has no named bindings to attribute and `export { default as X }` can't be
+   * name-matched, so both are skipped.
+   */
+  private emitReExportRefs(node: SyntaxNode, fromNodeId: string): void {
+    const clause = node.namedChildren.find((c) => c.type === 'export_clause');
+    if (!clause) return; // `export * from './y'` — no named bindings
+    for (const spec of clause.namedChildren) {
+      if (spec.type !== 'export_specifier') continue;
+      const nameNode = getChildByField(spec, 'name') ?? spec.namedChild(0);
+      if (!nameNode) continue;
+      const name = getNodeText(nameNode, this.source);
+      if (!name || name === 'default') continue;
+      this.unresolvedReferences.push({
+        fromNodeId,
+        referenceName: name,
+        referenceKind: 'imports',
+        line: nameNode.startPosition.row + 1,
+        column: nameNode.startPosition.column,
+      });
+    }
+  }
+
+  /**
+   * Emit one `imports` reference per name imported in a Python
+   * `from module import A, B as C` statement, attributed to the file node — so
+   * the resolver links each imported name to the module that DEFINES it.
+   *
+   * Same recall gap as TS: extraction only emitted references for calls,
+   * instantiations, and inheritance, so a name imported and then used in a
+   * non-call position (a list/dict literal, a default argument, a decorator
+   * target, or simply re-exported through an `__init__.py` barrel) produced no
+   * cross-file edge — the providing module showed a false "0 dependents". Links
+   * the LOCAL name (alias when present, since that's what the resolver's import
+   * mapping keys on); `from module import *` has no names to attribute.
+   */
+  private emitPyFromImportRefs(node: SyntaxNode, fromNodeId: string): void {
+    const moduleNameNode = getChildByField(node, 'module_name');
+    for (const child of node.namedChildren) {
+      // Skip the `from <module>` part itself and `import *`.
+      if (moduleNameNode &&
+          child.startIndex === moduleNameNode.startIndex &&
+          child.endIndex === moduleNameNode.endIndex) continue;
+      if (child.type === 'wildcard_import') continue;
+
+      let nameNode: SyntaxNode | null | undefined = null;
+      if (child.type === 'aliased_import') {
+        nameNode = getChildByField(child, 'alias') ?? getChildByField(child, 'name') ?? child.namedChild(0);
+      } else if (child.type === 'dotted_name') {
+        nameNode = child;
+      }
+      if (!nameNode) continue;
+
+      const raw = getNodeText(nameNode, this.source);
+      // Imported names are simple identifiers; defensively take the last segment.
+      const local = raw.includes('.') ? raw.split('.').pop()! : raw;
+      if (!local) continue;
+      this.unresolvedReferences.push({
+        fromNodeId,
+        referenceName: local,
+        referenceKind: 'imports',
+        line: nameNode.startPosition.row + 1,
+        column: nameNode.startPosition.column,
+      });
+    }
   }
 
   /**
@@ -1856,6 +2056,16 @@ export class TreeSitterExtractor {
       }
     }
 
+    // Parenthesized type conversions — Go `(*T)(x)` / `(T)(x)` (and a
+    // parenthesized callee generally) parse as a call whose "function" is a
+    // parenthesized type/expression, so the callee text is the un-resolvable
+    // literal `(*T)`. Normalize to the inner name so it resolves to `T` (a real
+    // dependency on the converted-to type) instead of dropping on the floor.
+    if (calleeName) {
+      const conv = calleeName.match(/^\(\s*\*?\s*([A-Za-z_][\w.]*)\s*\)$/);
+      if (conv && conv[1]) calleeName = conv[1];
+    }
+
     if (calleeName) {
       this.unresolvedReferences.push({
         fromNodeId: callerId,
@@ -1889,6 +2099,29 @@ export class TreeSitterExtractor {
       getChildByField(node, 'name') ||
       node.namedChild(0);
     if (!ctor) return;
+
+    // Go composite literals: `Widget{...}` (same package) and `pkga.Widget{...}`
+    // (cross-package). Only a directly-named struct type is a meaningful
+    // instantiation target — skip slice/map/array literals (`[]T{}`,
+    // `map[K]V{}`) whose `type` field is a composite type, not a named type.
+    // Unlike `new ns.Foo()`, KEEP the package qualifier (`pkga.Widget`) so the
+    // Go cross-package resolver can disambiguate it to the right package's type.
+    if (node.type === 'composite_literal') {
+      if (ctor.type !== 'type_identifier' && ctor.type !== 'qualified_type') return;
+      let goType = getNodeText(ctor, this.source).trim();
+      const brIdx = goType.indexOf('['); // strip Go generic args: `Box[T]{}` -> `Box`
+      if (brIdx > 0) goType = goType.slice(0, brIdx).trim();
+      if (goType) {
+        this.unresolvedReferences.push({
+          fromNodeId: fromId,
+          referenceName: goType,
+          referenceKind: 'instantiates',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
 
     let className = getNodeText(ctor, this.source);
     // Strip type-argument suffix first: `new Map<K, V>()` would
@@ -2141,6 +2374,24 @@ export class TreeSitterExtractor {
             });
           }
         }
+      }
+
+      // Local variable type annotations inside a body — `const items: Foo[] = []`,
+      // `const x: SomeType = svc.load()`. We deliberately do NOT create nodes for
+      // locals (that would explode the graph — the data-flow frontier we leave
+      // uncovered), but the TYPE a local is annotated with is a real dependency of
+      // the enclosing function, so attribute a `references` edge to it. Without
+      // this, a function that uses a type ONLY in its body (very common — e.g. a
+      // resolver building `const nodes: Node[] = []`) produced no edge to that
+      // type, so impact / `affected` missed the dependency entirely. We fall
+      // through to the default recursion below so the initializer's calls (and any
+      // nested declarators) are still walked.
+      if (
+        nodeType === 'variable_declarator' &&
+        this.TYPE_ANNOTATION_LANGUAGES.has(this.language)
+      ) {
+        const ownerId = this.nodeStack[this.nodeStack.length - 1];
+        if (ownerId) this.extractVariableTypeAnnotation(node, ownerId);
       }
 
       // Nested NAMED functions inside a body — function declarations and named

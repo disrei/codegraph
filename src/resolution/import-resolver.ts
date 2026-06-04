@@ -213,6 +213,24 @@ function resolveRelativeImport(
   const projectRoot = context.getProjectRoot();
   const extensions = EXTENSION_RESOLUTION[language] || [];
 
+  // Python dotted-relative imports (`from .certs import x`, `from ..pkg.mod
+  // import y`): leading dots are PACKAGE levels (1 = current package), and the
+  // remainder is a dotted submodule path. `path.resolve(dir, '.certs')` would
+  // treat `.certs` as a literal hidden filename, so translate the Python form
+  // to a real filesystem-relative path before resolving.
+  if (language === 'python' && importPath.startsWith('.')) {
+    const dots = importPath.length - importPath.replace(/^\.+/, '').length;
+    const up = '../'.repeat(Math.max(0, dots - 1));    // 1 dot = current dir
+    const rest = importPath.slice(dots).replace(/\./g, '/'); // 'sub.mod' -> 'sub/mod'
+    const pyBase = path.resolve(fromDir, up + rest);
+    const pyRel = path.relative(projectRoot, pyBase).replace(/\\/g, '/');
+    for (const ext of extensions) {
+      if (context.fileExists(pyRel + ext)) return pyRel + ext;
+    }
+    if (pyRel && context.fileExists(pyRel)) return pyRel;
+    return null;
+  }
+
   // Try the path as-is first
   const basePath = path.resolve(fromDir, importPath);
   const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
@@ -1074,6 +1092,31 @@ export function resolveViaImport(
     if (javaResult) return javaResult;
   }
 
+  // Python qualified access through an imported MODULE: `certs.where()` after
+  // `from . import certs`, `mod.func()` after `import mod`. The receiver names a
+  // submodule (a file), not a symbol, so the generic symbol lookup below would
+  // search the *package* for `certs` instead of looking inside the module.
+  if (ref.language === 'python') {
+    const pyResult = resolvePythonModuleMember(ref, imports, context);
+    if (pyResult) return pyResult;
+  }
+
+  // Whole-module / namespace imports → link the importing file to the module
+  // file. Python `from . import certs` / `import mod`, and TS/JS `import * as ns
+  // from './x'` (so a namespace touched only via a value-member read still
+  // records the dependency). A named TS/JS import returns null here and falls
+  // through to symbol resolution below.
+  if (
+    ref.language === 'python' ||
+    ref.language === 'typescript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'javascript' ||
+    ref.language === 'jsx'
+  ) {
+    const moduleFile = resolveModuleImportToFile(ref, imports, context);
+    if (moduleFile) return moduleFile;
+  }
+
   // Check if the reference name matches any import
   for (const imp of imports) {
     if (imp.localName === ref.referenceName || ref.referenceName.startsWith(imp.localName + '.')) {
@@ -1111,6 +1154,120 @@ export function resolveViaImport(
     }
   }
 
+  return null;
+}
+
+/**
+ * Resolve a Python qualified reference whose receiver is an imported MODULE:
+ * `certs.where()` after `from . import certs`, `mod.func()` after `import mod`
+ * or `from pkg import mod`. The receiver names a submodule (a file), not a
+ * symbol, so the generic symbol lookup in `resolveViaImport` can't follow it —
+ * it would search the *package* for `certs`/`mod` instead of looking inside the
+ * module. This is the Python half of the cross-package qualified-call problem
+ * (cf. `resolveGoCrossPackageReference` for Go's `pkg.Func`, issue #388).
+ *
+ * Builds the module's dotted import path from the binding — `from . import
+ * certs` → `.certs`; `from pkg import mod` → `pkg.mod`; `import mod` → `mod` —
+ * resolves it to the module file, and finds the member defined there. Returns
+ * null when no module file exists at that path, so attribute access on an
+ * imported *value* (`helper.attr` where `helper` is a function) falls through
+ * to the other strategies untouched.
+ */
+function resolvePythonModuleMember(
+  ref: UnresolvedRef,
+  imports: ImportMapping[],
+  context: ResolutionContext
+): ResolvedRef | null {
+  const dotIdx = ref.referenceName.indexOf('.');
+  if (dotIdx <= 0) return null;
+  const receiver = ref.referenceName.substring(0, dotIdx);
+  // The immediate member of the module (first segment after the receiver).
+  const member = ref.referenceName.substring(dotIdx + 1).split('.')[0];
+  if (!member) return null;
+
+  for (const imp of imports) {
+    if (imp.localName !== receiver) continue;
+
+    // `import mod` / `import numpy as np` bind the module at `source` itself;
+    // `from . import certs` / `from pkg import mod` bind a SUBMODULE whose
+    // dotted path is the source joined with the imported name.
+    const modulePath = imp.isNamespace
+      ? imp.source
+      : imp.source.endsWith('.')
+        ? imp.source + imp.localName
+        : imp.source + '.' + imp.localName;
+
+    const resolvedPath = resolveImportPath(modulePath, ref.filePath, ref.language, context);
+    if (!resolvedPath || resolvedPath === ref.filePath) continue;
+
+    // Find the member as a top-level definition in the module file. Exclude
+    // `method` so `mod.foo` never lands on a same-named class method.
+    const target = context.getNodesInFile(resolvedPath).find(
+      (n) =>
+        n.name === member &&
+        (n.kind === 'function' ||
+          n.kind === 'class' ||
+          n.kind === 'variable' ||
+          n.kind === 'constant')
+    );
+    if (target) {
+      return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'import' };
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a whole-MODULE import to that module's file (a file→file dependency).
+ * The imported name is a module, not a symbol, so there's nothing to resolve to
+ * — but importing a module IS a dependency on it. Covers:
+ *   - Python submodule imports — `from . import certs`, `from pkg import sub`;
+ *   - namespace imports — Python `import mod` / `import numpy as np`, and
+ *     TS/JS `import * as ns from './x'`.
+ *
+ * It is also the robust backstop for {@link resolvePythonModuleMember} and for
+ * TS namespace usage: it records the dependency even when the used member is
+ * re-exported elsewhere (requests' `certs.where`, re-exported from `certifi`),
+ * the usage is module-level code that isn't extracted as a call, or a TS
+ * namespace is touched only via a value-member read (`ns.SOME_CONST`).
+ *
+ * Only fires for dot-free `imports`-kind refs whose module path resolves to a
+ * real file. A NAMED TS/JS import (`import { widget }`) is not a module, so it
+ * returns null and normal symbol resolution handles it.
+ */
+function resolveModuleImportToFile(
+  ref: UnresolvedRef,
+  imports: ImportMapping[],
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.referenceKind !== 'imports') return null;
+  if (ref.referenceName.includes('.')) return null;
+
+  for (const imp of imports) {
+    if (imp.localName !== ref.referenceName) continue;
+
+    let modulePath: string;
+    if (imp.isNamespace) {
+      // `import * as ns from './x'` / `import mod` — the source IS the module.
+      modulePath = imp.source;
+    } else if (ref.language === 'python') {
+      // `from . import certs` — the imported NAME is a submodule of the source.
+      modulePath = imp.source.endsWith('.')
+        ? imp.source + imp.localName
+        : imp.source + '.' + imp.localName;
+    } else {
+      // A named TS/JS import binds a symbol, not a module — leave it alone.
+      continue;
+    }
+
+    const resolvedPath = resolveImportPath(modulePath, ref.filePath, ref.language, context);
+    if (!resolvedPath || resolvedPath === ref.filePath) continue;
+
+    const fileNode = context.getNodesInFile(resolvedPath).find((n) => n.kind === 'file');
+    if (fileNode) {
+      return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+    }
+  }
   return null;
 }
 

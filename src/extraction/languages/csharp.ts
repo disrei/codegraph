@@ -4,10 +4,14 @@ import type { LanguageExtractor } from '../tree-sitter-types';
 
 export const csharpExtractor: LanguageExtractor = {
   functionTypes: [],
-  classTypes: ['class_declaration'],
+  // Records are first-class type declarations in modern C# (DTOs, value objects,
+  // MediatR/CQRS messages). `record` / `record class` parse as record_declaration
+  // (reference type → class); `record struct` as record_struct_declaration (value
+  // type → struct). Without these, references to a record never resolve (#237).
+  classTypes: ['class_declaration', 'record_declaration'],
   methodTypes: ['method_declaration', 'constructor_declaration'],
   interfaceTypes: ['interface_declaration'],
-  structTypes: ['struct_declaration'],
+  structTypes: ['struct_declaration', 'record_struct_declaration'],
   enumTypes: ['enum_declaration'],
   enumMemberTypes: ['enum_member_declaration'],
   typeAliasTypes: [],
