@@ -1826,18 +1826,37 @@ export class TreeSitterExtractor {
 
     // Python import_statement: import os, sys (creates one import per module)
     if (this.language === 'python' && node.type === 'import_statement') {
+      const importParentId = this.nodeStack[this.nodeStack.length - 1];
+      // A bare `import a.b.c` of an internal module (the standard Django
+      // `AppConfig.ready(): import myapp.signals` registration pattern, and any
+      // `import pkg.mod` used for its side effects) had no edge to the module
+      // file — only `from x import y` was linked. Push an `imports` ref (like
+      // Go) so the resolver maps the dotted path to its file. Stdlib/external
+      // modules naturally don't resolve (no `os.py` file node in the repo).
+      const pushModuleRef = (dotted: SyntaxNode): void => {
+        if (!importParentId) return;
+        this.unresolvedReferences.push({
+          fromNodeId: importParentId,
+          referenceName: getNodeText(dotted, this.source),
+          referenceKind: 'imports',
+          line: dotted.startPosition.row + 1,
+          column: dotted.startPosition.column,
+        });
+      };
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child?.type === 'dotted_name') {
           this.createNode('import', getNodeText(child, this.source), node, {
             signature: importText,
           });
+          pushModuleRef(child);
         } else if (child?.type === 'aliased_import') {
           const dottedName = child.namedChildren.find(c => c.type === 'dotted_name');
           if (dottedName) {
             this.createNode('import', getNodeText(dottedName, this.source), node, {
               signature: importText,
             });
+            pushModuleRef(dottedName);
           }
         }
       }

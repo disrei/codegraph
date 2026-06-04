@@ -3856,6 +3856,47 @@ describe('Cross-language type/import gate (RN name collisions)', () => {
   });
 });
 
+describe('Python absolute module import resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a bare `import pkg.module` of an internal module to its file', async () => {
+    // `import conduit.apps.signals` (a Django-style side-effect import, and any
+    // dotted absolute module import) had no edge to the module file — only
+    // `from x import y` was linked — so a module imported by its dotted path
+    // looked like nothing depended on it.
+    fs.mkdirSync(path.join(tempDir, 'conduit/apps'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'conduit/__init__.py'), '');
+    fs.writeFileSync(path.join(tempDir, 'conduit/apps/__init__.py'), '');
+    fs.writeFileSync(path.join(tempDir, 'conduit/apps/signals.py'), `def handler():\n    pass\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'conduit/apps/app.py'),
+      `import conduit.apps.signals\nimport os\n\nVALUE = 1\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const signals = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('conduit/apps/signals.py'));
+    expect(signals, 'signals.py indexed').toBeDefined();
+    const deps = [...cg.getImpactRadius(signals!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('app.py')), 'importer depends on the module').toBe(true);
+    // `import os` (stdlib) must NOT fabricate an edge — no os.py file in the repo.
+    const osNode = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('/os.py'));
+    expect(osNode, 'no stdlib os.py node').toBeUndefined();
+  });
+});
+
 describe('Same-directory include + KMP import resolution', () => {
   let tempDir: string;
   let cg: CodeGraph;

@@ -1155,6 +1155,11 @@ export function resolveViaImport(
   if (ref.language === 'python') {
     const pyResult = resolvePythonModuleMember(ref, imports, context);
     if (pyResult) return pyResult;
+    // Absolute dotted module import: `import conduit.apps.articles.signals`
+    // (the standard Django AppConfig.ready() signal-registration pattern, and
+    // any side-effect `import pkg.mod`). Map the dotted path to its file.
+    const pyModResult = resolvePythonAbsoluteModule(ref, context);
+    if (pyModResult) return pyModResult;
   }
 
   // Rust qualified path: resolve the module prefix of `crate::m::Item` /
@@ -1332,6 +1337,40 @@ function resolveModuleImportToFile(
     if (fileNode) {
       return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
     }
+  }
+  return null;
+}
+
+/**
+ * Resolve a Python ABSOLUTE dotted module import (`import a.b.c`) to its file.
+ * `a.b.c` → a file node ending in `a/b/c.py` (a module) or `a/b/c/__init__.py`
+ * (a package). The suffix match tolerates a package rooted under `src/` etc.
+ * Stdlib/external modules return null (no matching file node in the repo), so
+ * `import os` creates no edge. Covers the Django `AppConfig.ready(): import
+ * myapp.signals` pattern and any side-effect module import.
+ */
+function resolvePythonAbsoluteModule(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.referenceKind !== 'imports') return null;
+  const mod = ref.referenceName;
+  if (!mod || mod.startsWith('.')) return null; // relative imports handled elsewhere
+  const rel = mod.replace(/\./g, '/');
+  const lastSeg = mod.split('.').pop()!;
+  const wantModule = `${rel}.py`;
+  const wantPkg = `${rel}/__init__.py`;
+  const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
+
+  const moduleFiles = context.getNodesByName(`${lastSeg}.py`).filter((n) => n.kind === 'file');
+  const hitModule = moduleFiles.find((n) => endsWith(n.filePath, wantModule));
+  if (hitModule && hitModule.filePath !== ref.filePath) {
+    return { original: ref, targetNodeId: hitModule.id, confidence: 0.9, resolvedBy: 'import' };
+  }
+  const pkgFiles = context.getNodesByName('__init__.py').filter((n) => n.kind === 'file');
+  const hitPkg = pkgFiles.find((n) => endsWith(n.filePath, wantPkg));
+  if (hitPkg && hitPkg.filePath !== ref.filePath) {
+    return { original: ref, targetNodeId: hitPkg.id, confidence: 0.9, resolvedBy: 'import' };
   }
   return null;
 }
