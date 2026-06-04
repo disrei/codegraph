@@ -363,6 +363,23 @@ export class TreeSitterExtractor {
       this.extractVariable(node);
       skipChildren = true; // extractVariable handles children
     }
+    // Swift stored properties inside a type. Swift instance properties aren't
+    // extracted as their own nodes, but a property's PROPERTY WRAPPER
+    // (`@Argument`/`@Published`/`@State`/custom) and declared type ARE
+    // dependencies — attribute them to the enclosing type so the wrapper/type
+    // files get dependents. Don't skipChildren: an initializer's calls still
+    // matter. (Other languages extract properties via property/field types.)
+    else if (
+      this.language === 'swift' &&
+      nodeType === 'property_declaration' &&
+      this.isInsideClassLikeNode()
+    ) {
+      const ownerId = this.nodeStack[this.nodeStack.length - 1];
+      if (ownerId) {
+        this.extractDecoratorsFor(node, ownerId);
+        this.extractVariableTypeAnnotation(node, ownerId);
+      }
+    }
     // `export_statement` itself is not extracted — the walker descends
     // into children, where the inner declaration (lexical_declaration,
     // function_declaration, class_declaration, etc.) is dispatched to
@@ -2316,12 +2333,14 @@ export class TreeSitterExtractor {
     const consider = (n: SyntaxNode | null): void => {
       if (!n) return;
       // `marker_annotation` is Java's grammar for arg-less annotations
-      // (`@Override`, `@Deprecated`); without including it, every
-      // such Java annotation would be silently skipped.
+      // (`@Override`, `@Deprecated`); `attribute` is Swift's grammar for
+      // attributes and PROPERTY WRAPPERS (`@objc`, `@Argument`, `@Published`,
+      // `@State`). Without these, those usages would be silently skipped.
       if (
         n.type !== 'decorator' &&
         n.type !== 'annotation' &&
-        n.type !== 'marker_annotation'
+        n.type !== 'marker_annotation' &&
+        n.type !== 'attribute'
       ) {
         return;
       }
@@ -2340,7 +2359,9 @@ export class TreeSitterExtractor {
           child.type === 'identifier' ||
           child.type === 'member_expression' ||
           child.type === 'scoped_identifier' ||
-          child.type === 'navigation_expression'
+          child.type === 'navigation_expression' ||
+          child.type === 'user_type' ||      // swift attribute → user_type (`@Argument`)
+          child.type === 'type_identifier'
         ) {
           target = child;
           break;
@@ -2348,8 +2369,11 @@ export class TreeSitterExtractor {
       }
       if (!target) return;
       let name = getNodeText(target, this.source);
+      const lt = name.indexOf('<'); // strip generic args: `@Argument<T>` → `Argument`
+      if (lt > 0) name = name.slice(0, lt);
       const lastDot = Math.max(name.lastIndexOf('.'), name.lastIndexOf('::'));
       if (lastDot >= 0) name = name.slice(lastDot + 1).replace(/^[:.]/, '');
+      name = name.trim();
       if (!name) return;
       this.unresolvedReferences.push({
         fromNodeId: decoratedId,
