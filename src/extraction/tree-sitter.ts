@@ -160,6 +160,35 @@ const PHP_TYPE_NODES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Member-access node kinds whose receiver, when it's a capitalized
+ * type/enum/class name, is a real dependency — `Enum.value`, `Type.CONST`,
+ * `Foo::BAR`. These VALUE reads (as opposed to `Type.method()` calls, already
+ * handled) produced no edge, so a type used only via a static member or enum
+ * value looked like nothing depended on it. See {@link extractStaticMemberRef}.
+ */
+const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
+  'field_access',                       // java (`Foo.BAR`)
+  'member_access_expression',           // c#  (`Foo.Bar`)
+  'navigation_expression',              // kotlin / swift (`Foo.bar`)
+  'field_expression',                   // scala (`Foo.bar`)
+  'class_constant_access_expression',   // php (`Foo::CONST`, `Foo::class`)
+  'scoped_property_access_expression',  // php (`Foo::$bar`)
+  'qualified_identifier',               // c++ (`Foo::bar`)
+]);
+
+/**
+ * Languages whose types are Capitalized by convention, so a capitalized
+ * member-access receiver is reliably a type (not a local/variable). The
+ * static-member/value-read pass is gated to these — the ones where it was the
+ * confirmed residual frontier (enum-value / static-field reads). TS/JS/Python
+ * are deliberately excluded: their coverage was already high and they drive the
+ * retrieval-performance benchmark, so there's no need to perturb their graph.
+ */
+const STATIC_MEMBER_LANGS: ReadonlySet<string> = new Set([
+  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp',
+]);
+
+/**
  * Tree-sitter node kinds that represent constructor invocations
  * (`new Foo()` and friends). Used by extractInstantiation to emit
  * an `instantiates` reference targeting the class name.
@@ -2399,6 +2428,76 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Static-member / value-read pass. A type/enum/class used only via a member
+   * VALUE — `Enum.value`, `Type.CONST`, `Colors.red`, `Foo::BAR` — recorded no
+   * edge, because the body walker only handled CALLS (`Type.method()`). So a
+   * type referenced only by an enum value or a static field looked like nothing
+   * depended on it (the residual frontier across Dart/Java/C#/Swift/Kotlin/PHP).
+   * Emit a `references` edge to the capitalized receiver. Gated to languages
+   * where types are Capitalized by convention, and skipped when the access is a
+   * call's callee (the call extractor already links the method).
+   */
+  private extractStaticMemberRef(node: SyntaxNode): void {
+    if (!STATIC_MEMBER_LANGS.has(this.language)) return;
+    if (this.nodeStack.length === 0) return;
+    const ownerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!ownerId) return;
+
+    // Dart structures member access as an `identifier` + a sibling `selector`,
+    // not a single node. A value-read selector (no `argument_part`) whose
+    // previous sibling is a capitalized identifier is `Enum.value`.
+    if (this.language === 'dart') {
+      if (node.type !== 'selector') return;
+      if (node.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) return;
+      const prev = node.previousNamedSibling;
+      if (prev?.type === 'identifier' && /^[A-Z][A-Za-z0-9_]*$/.test(prev.text)) {
+        this.pushStaticMemberRef(prev.text, ownerId, prev);
+      }
+      return;
+    }
+
+    if (!MEMBER_ACCESS_TYPES.has(node.type)) return;
+
+    // Skip `Type.method()` — the access is the callee of a call, already linked.
+    const parent = node.parent;
+    if (parent && this.extractor!.callTypes.includes(parent.type)) {
+      const callee =
+        getChildByField(parent, 'function') ??
+        getChildByField(parent, 'method') ??
+        parent.namedChild(0);
+      if (callee && callee.startIndex === node.startIndex) return;
+    }
+
+    // The receiver must be a SIMPLE capitalized identifier — `Type.X`, not the
+    // nested `a.B.c` (whose own head member-access is visited separately) nor a
+    // lowercase `obj.field` / `pkg.func`.
+    const recv =
+      getChildByField(node, 'object') ??
+      getChildByField(node, 'expression') ??
+      getChildByField(node, 'scope') ??
+      node.namedChild(0);
+    if (!recv) return;
+    const t = recv.type;
+    if (
+      t === 'identifier' || t === 'type_identifier' || t === 'simple_identifier' ||
+      t === 'name' || t === 'scoped_type_identifier'
+    ) {
+      const text = getNodeText(recv, this.source);
+      if (/^[A-Z][A-Za-z0-9_]*$/.test(text)) this.pushStaticMemberRef(text, ownerId, recv);
+    }
+  }
+
+  private pushStaticMemberRef(name: string, ownerId: string, node: SyntaxNode): void {
+    this.unresolvedReferences.push({
+      fromNodeId: ownerId,
+      referenceName: name,
+      referenceKind: 'references',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
+  /**
    * Find a `class_body` child of an `object_creation_expression` — the
    * marker for an anonymous class (`new T() { ... }`). Returns the body
    * node so the caller can walk it as the anon class's members.
@@ -2639,6 +2738,9 @@ export class TreeSitterExtractor {
           }
         }
       }
+
+      // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.
+      this.extractStaticMemberRef(node);
 
       // Local variable type annotations inside a body — `const items: Foo[] = []`,
       // `const x: SomeType = svc.load()`. We deliberately do NOT create nodes for

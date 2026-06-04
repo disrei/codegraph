@@ -3686,6 +3686,63 @@ class UserService extends Repository with Loggable {
   });
 });
 
+describe('Static-member / value-read references', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a type referenced only via a static field / enum value (and ignores lowercase receivers)', async () => {
+    fs.writeFileSync(
+      path.join(tempDir, 'JsonScope.java'),
+      `class JsonScope {
+  static final int EMPTY_DOCUMENT = 1;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Reader.java'),
+      `class Reader {
+  private int helper;
+  int peek() {
+    return JsonScope.EMPTY_DOCUMENT;
+  }
+  int noop() {
+    return this.helper;
+  }
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // JsonScope is used ONLY as `JsonScope.EMPTY_DOCUMENT` (a static-field value
+    // read — never constructed or called), so before the static-member pass it
+    // had no dependents. Editing it now surfaces Reader.java.
+    const scope = cg.getNodesByKind('class').find((n) => n.name === 'JsonScope');
+    expect(scope, 'JsonScope indexed').toBeDefined();
+    const reached = [...cg.getImpactRadius(scope!.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+    expect(reached.some((p) => p.endsWith('Reader.java'))).toBe(true);
+
+    // A lowercase receiver (`this.helper`) must NOT be emitted as a type ref —
+    // only Capitalized receivers (types) are. No node named `this`/`helper`
+    // should appear as a reference target from peek/noop beyond JsonScope.
+    const refTargets = cg
+      .getNodesByKind('class')
+      .filter((n) => n.name === 'this' || n.name === 'helper');
+    expect(refTargets.length).toBe(0);
+  });
+});
+
 describe('Full Indexing', () => {
   let tempDir: string;
 
