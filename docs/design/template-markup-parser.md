@@ -1,7 +1,10 @@
 # Scope: Template-markup parser (Razor / Blazor / Thymeleaf)
 
-Status: **proposed** (scoping only — not implemented). Authored 2026-06-04 from the
-cross-language impact-coverage campaign (`feat/cross-language-impact-coverage`).
+Status: **P1+P2+@code IMPLEMENTED** (commits 59b8de2 directives/tags, 90c5f39 @code
+delegation) on `feat/cross-language-impact-coverage`. Razor/Blazor markup is parsed
+(`src/extraction/razor-extractor.ts`). Remaining: `@using` namespace disambiguation
+for DTO-vs-entity name collisions (the residual ASP.NET gap), and Thymeleaf/Django
+(P4, deferred — weak code links). Authored 2026-06-04.
 
 ## Problem
 
