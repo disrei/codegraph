@@ -185,6 +185,10 @@ export class ReferenceResolver {
   private queries: QueryBuilder;
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
+  // Per-`.razor`/`.cshtml`-file `@using` namespace set (own directives + folder
+  // `_Imports.razor`, cascading to the project root). Used to disambiguate a
+  // markup type ref to the right C# namespace.
+  private razorUsingsCache = new Map<string, string[]>();
   // All per-resolver caches are LRU-bounded. Previously these were
   // unbounded Maps that grew with every distinct lookup and OOM'd on
   // codebases with 20k+ files (see issue: unbounded cache growth).
@@ -620,6 +624,16 @@ export class ReferenceResolver {
     const jvmImport = resolveJvmImport(ref, this.context);
     if (jvmImport) return jvmImport;
 
+    // Razor/Blazor: a markup or `@code` type ref resolves through the file's
+    // `@using` namespaces (incl. folder `_Imports.razor`). This precisely
+    // disambiguates a simple name that exists in several namespaces — e.g.
+    // `CatalogBrand` resolving to `BlazorShared.Models::CatalogBrand` (the DTO,
+    // which the `.razor` `@using`s) rather than the same-named domain entity.
+    if (ref.language === 'razor') {
+      const razorResult = this.resolveRazorUsing(ref);
+      if (razorResult) return razorResult;
+    }
+
     const candidates: ResolvedRef[] = [];
 
     // Strategy 1: Try framework-specific resolution. Cross-language bridges
@@ -964,6 +978,55 @@ export class ReferenceResolver {
    *    `.ts`) importing across is left alone.
    * Applies to the import (strategy 2) + name-match (strategy 3) results.
    */
+  /**
+   * Collect the `@using` namespaces in scope for a `.razor`/`.cshtml` file: its
+   * own `@using` directives plus every `_Imports.razor` from the file's folder up
+   * to the project root (Razor `_Imports` cascade). Cached per file.
+   */
+  private getRazorUsings(filePath: string): string[] {
+    const cached = this.razorUsingsCache.get(filePath);
+    if (cached) return cached;
+    const usings = new Set<string>();
+    const addFrom = (src: string | null): void => {
+      if (!src) return;
+      for (const m of src.matchAll(/^\s*@using\s+(?:static\s+)?([A-Za-z_][\w.]*)/gm)) usings.add(m[1]!);
+    };
+    addFrom(this.context.readFile(filePath));
+    let dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/')) : '';
+    // Walk up to the project root, reading each level's _Imports.razor.
+    for (;;) {
+      addFrom(this.context.readFile(dir ? `${dir}/_Imports.razor` : '_Imports.razor'));
+      if (!dir) break;
+      const slash = dir.lastIndexOf('/');
+      dir = slash >= 0 ? dir.slice(0, slash) : '';
+    }
+    const arr = [...usings];
+    this.razorUsingsCache.set(filePath, arr);
+    return arr;
+  }
+
+  /**
+   * Resolve a Razor/Blazor simple type ref through the file's `@using`
+   * namespaces: `CatalogBrand` + `@using BlazorShared.Models` → the node whose
+   * qualified name is `BlazorShared.Models::CatalogBrand`. Only resolves when the
+   * `@using` set yields exactly ONE type (otherwise it stays ambiguous and falls
+   * through to name-matching).
+   */
+  private resolveRazorUsing(ref: UnresolvedRef): ResolvedRef | null {
+    if (ref.referenceName.includes('.') || ref.referenceName.includes('::')) return null;
+    const usings = this.getRazorUsings(ref.filePath);
+    if (usings.length === 0) return null;
+    const found = new Map<string, Node>();
+    for (const ns of usings) {
+      for (const cand of this.context.getNodesByQualifiedName(`${ns}::${ref.referenceName}`)) {
+        found.set(cand.id, cand);
+      }
+    }
+    if (found.size !== 1) return null;
+    const target = found.values().next().value!;
+    return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+  }
+
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
