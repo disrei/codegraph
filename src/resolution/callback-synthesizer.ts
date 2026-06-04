@@ -1077,6 +1077,51 @@ function rnEventEdges(ctx: ResolutionContext): Edge[] {
  */
 const FABRIC_NATIVE_SUFFIXES = ['', 'View', 'ViewManager', 'ComponentView', 'Manager'];
 
+/**
+ * Expo Modules cross-platform pairing. An Expo Module exposes the SAME
+ * JS-visible method (`AsyncFunction("getBatteryLevelAsync")`) from BOTH an iOS
+ * (Swift) and an Android (Kotlin) implementation. A JS callsite name-resolves to
+ * only ONE of them, so the other platform's impl looked like nothing called it
+ * (and editing it showed no blast radius). Link the iOS and Android impls of the
+ * same `<module>.<method>` to each other (both directions), so a JS call that
+ * reaches one platform reaches the other, and editing either surfaces the JS
+ * caller. The Expo method nodes are id-prefixed `expo-module:` and qualified
+ * `<file>::<module>.<method>` by the framework extractor.
+ */
+function expoCrossPlatformEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const byKey = new Map<string, Node[]>();
+  for (const m of queries.getNodesByKind('method')) {
+    if (!m.id.startsWith('expo-module:')) continue;
+    const key = m.qualifiedName.split('::').pop(); // `<module>.<method>`
+    if (!key) continue;
+    const arr = byKey.get(key);
+    if (arr) arr.push(m);
+    else byKey.set(key, [m]);
+  }
+  for (const group of byKey.values()) {
+    if (group.length < 2) continue;
+    for (const a of group) {
+      for (const b of group) {
+        if (a.id === b.id || a.language === b.language) continue; // cross-platform only
+        const key = `${a.id}>${b.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: a.id,
+          target: b.id,
+          kind: 'calls',
+          line: a.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'expo-cross-platform', via: a.name },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
 function fabricNativeImplEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -1336,6 +1381,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const goGrpcEdges = goGrpcStubImplEdges(queries);
   const rnEventEdgesList = rnEventEdges(ctx);
   const fabricNativeEdges = fabricNativeImplEdges(ctx);
+  const expoXPlatEdges = expoCrossPlatformEdges(queries);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
   const ginEdges = ginMiddlewareChainEdges(queries, ctx);
 
@@ -1355,6 +1401,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...goGrpcEdges,
     ...rnEventEdgesList,
     ...fabricNativeEdges,
+    ...expoXPlatEdges,
     ...mybatisEdges,
     ...ginEdges,
   ]) {

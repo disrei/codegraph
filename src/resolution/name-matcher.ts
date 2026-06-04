@@ -69,13 +69,41 @@ export function matchByFilePath(
 }
 
 /**
+ * Language families that share a type system / runtime, so a same-language-only
+ * reference may still resolve across them (a Kotlin `Foo.BAR` can name a Java
+ * `Foo`). Anything not listed forms its own singleton family.
+ */
+const LANGUAGE_FAMILY: Record<string, string> = {
+  java: 'jvm', kotlin: 'jvm', scala: 'jvm',
+  swift: 'apple', objc: 'apple',
+  typescript: 'web', tsx: 'web', javascript: 'web', jsx: 'web',
+  c: 'c', cpp: 'c',
+};
+export function sameLanguageFamily(a: string, b: string): boolean {
+  if (a === b) return true;
+  const fa = LANGUAGE_FAMILY[a];
+  return fa !== undefined && fa === LANGUAGE_FAMILY[b];
+}
+/**
+ * Drop cross-family candidates for a `references` (type-usage) edge. A type used
+ * in language X — a field/param/return type, a `Type.member` static read — names
+ * a same-family type, never a coincidentally same-named symbol in another
+ * language (the Android `BatteryManager` system class vs a JS `BatteryManager`).
+ * Cross-language communication is modeled by `calls` bridges, not `references`.
+ */
+function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
+  if (ref.referenceKind !== 'references') return candidates;
+  return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  const candidates = context.getNodesByName(ref.referenceName);
+  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref);
 
   if (candidates.length === 0) {
     return null;
@@ -668,7 +696,7 @@ export function matchFuzzy(
 
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind));
+  const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);

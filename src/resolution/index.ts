@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference } from './name-matcher';
+import { matchReference, sameLanguageFamily } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -622,7 +622,9 @@ export class ReferenceResolver {
 
     const candidates: ResolvedRef[] = [];
 
-    // Strategy 1: Try framework-specific resolution
+    // Strategy 1: Try framework-specific resolution. NOT language-gated:
+    // framework resolvers deliberately bridge config↔code across languages
+    // (Drupal `routing.yml` → PHP controller, Spring `@Value` → YAML key).
     for (const framework of this.frameworks) {
       const result = framework.resolve(ref, this.context);
       if (result) {
@@ -632,14 +634,14 @@ export class ReferenceResolver {
     }
 
     // Strategy 2: Try import-based resolution
-    const importResult = resolveViaImport(ref, this.context);
+    const importResult = this.gateLanguage(resolveViaImport(ref, this.context), ref);
     if (importResult) {
       if (importResult.confidence >= 0.9) return importResult;
       candidates.push(importResult);
     }
 
     // Strategy 3: Try name matching
-    const nameResult = matchReference(ref, this.context);
+    const nameResult = this.gateLanguage(matchReference(ref, this.context), ref);
     if (nameResult) {
       candidates.push(nameResult);
     }
@@ -946,6 +948,19 @@ export class ReferenceResolver {
   private getLanguageFromNodeId(nodeId: string): UnresolvedRef['language'] {
     const node = this.queries.getNodeById(nodeId);
     return node?.language || 'unknown';
+  }
+
+  /**
+   * Drop a resolution that crosses a language family when the reference is
+   * `sameLanguageOnly` (a `Type.member` static read names a same-family type,
+   * never a coincidentally same-named symbol in another language). Covers ALL
+   * strategies (framework / import / name-match) at one chokepoint.
+   */
+  private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!result || ref.referenceKind !== 'references') return result;
+    const tgt = this.getLanguageFromNodeId(result.targetNodeId);
+    if (tgt && ref.language && !sameLanguageFamily(tgt, ref.language)) return null;
+    return result;
   }
 }
 

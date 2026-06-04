@@ -3741,6 +3741,30 @@ describe('Static-member / value-read references', () => {
       .filter((n) => n.name === 'this' || n.name === 'helper');
     expect(refTargets.length).toBe(0);
   });
+
+  it('does not link a static-member read across language families (coincidental name)', async () => {
+    // A native (Kotlin) `Build.VERSION` reads the Android system class — it must
+    // NOT link to a coincidentally same-named TS class (the cross-language false
+    // positive that name-matching produces; `references` edges are language-local).
+    fs.writeFileSync(
+      path.join(tempDir, 'Build.ts'),
+      `export class Build {\n  static version = 1;\n}\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Device.kt'),
+      `package app\nclass Device {\n  fun sdk(): Int = Build.VERSION\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const tsBuild = cg.getNodesByKind('class').find((n) => n.name === 'Build' && n.filePath.endsWith('Build.ts'));
+    expect(tsBuild).toBeDefined();
+    // The Kotlin file is `app/Device.kt`; the TS Build must have NO dependent there.
+    const deps = [...cg.getImpactRadius(tsBuild!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('Device.kt'))).toBe(false);
+  });
 });
 
 describe('Objective-C messages, class receivers, and #import', () => {
