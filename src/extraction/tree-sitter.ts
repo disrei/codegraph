@@ -20,6 +20,7 @@ import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } f
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { LiquidExtractor } from './liquid-extractor';
+import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
@@ -4031,6 +4032,10 @@ export function extractFromSource(
   } else if (detectedLanguage === 'liquid') {
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'razor') {
+    // Use custom extractor for ASP.NET Razor (.cshtml) / Blazor (.razor) markup
+    const extractor = new RazorExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'xml') {
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a

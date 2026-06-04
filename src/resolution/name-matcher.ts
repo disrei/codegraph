@@ -115,6 +115,9 @@ const LANGUAGE_FAMILY: Record<string, string> = {
   swift: 'apple', objc: 'apple',
   typescript: 'web', tsx: 'web', javascript: 'web', jsx: 'web',
   c: 'c', cpp: 'c',
+  // Razor/Blazor markup names C# types — same family so `@model Foo` /
+  // `<MyComponent/>` resolve to their `.cs` class through the cross-family gate.
+  csharp: 'dotnet', razor: 'dotnet',
 };
 export function sameLanguageFamily(a: string, b: string): boolean {
   if (a === b) return true;

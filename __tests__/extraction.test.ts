@@ -3953,6 +3953,60 @@ describe('Python absolute module import resolution', () => {
   });
 });
 
+describe('Razor / Blazor markup extraction', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links @model and Blazor component tags to their C# types; ignores HTML elements', async () => {
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'LoginViewModel.cs'),
+      `namespace App { public class LoginViewModel { public string Email { get; set; } } }`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'ToastComponent.cs'),
+      `namespace App { public class ToastComponent { } }`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Views/Login.cshtml'),
+      `@model LoginViewModel\n<div class="form">\n  <input asp-for="Email" />\n</div>\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Index.razor'),
+      `<div>\n  <ToastComponent />\n</div>\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // `@model LoginViewModel` → the view-model class.
+    const vm = cg.getNodesByKind('class').find((n) => n.name === 'LoginViewModel');
+    expect(vm, 'LoginViewModel class').toBeDefined();
+    const vmDeps = [...cg.getImpactRadius(vm!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(vmDeps.some((p) => p.endsWith('Login.cshtml')), '@model links the view').toBe(true);
+
+    // `<ToastComponent />` → the component class.
+    const toast = cg.getNodesByKind('class').find((n) => n.name === 'ToastComponent');
+    expect(toast, 'ToastComponent class').toBeDefined();
+    const toastDeps = [...cg.getImpactRadius(toast!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(toastDeps.some((p) => p.endsWith('Index.razor')), 'Blazor tag links the component').toBe(true);
+
+    // HTML elements (`<div>`, `<input>`) must NOT become component references.
+    const htmlNodes = cg.getNodesByKind('class').filter((n) => n.name === 'div' || n.name === 'input');
+    expect(htmlNodes.length, 'no node for HTML elements').toBe(0);
+  });
+});
+
 describe('Default import resolution (renamed default export)', () => {
   let tempDir: string;
   let cg: CodeGraph;
