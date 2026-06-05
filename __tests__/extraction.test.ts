@@ -4210,6 +4210,55 @@ describe('Same-directory include + KMP import resolution', () => {
   });
 });
 
+describe('Rust module-path call resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a bare submodule call (`users::router()`) resolves self-relative to the submodule fn', async () => {
+    // The canonical Axum router-assembly pattern: a parent module calls each
+    // submodule's `router()`. `users::` / `profiles::` are SELF-relative
+    // submodule prefixes (2018 edition) — `mod users;` makes `users` a child of
+    // the CURRENT module, NOT `crate::users`. Before the fix the bare prefix was
+    // resolved crate-relative only (looking for `src/users.rs`), so it found
+    // nothing and the handler modules looked dependent-less.
+    const http = path.join(tempDir, 'src/http');
+    fs.mkdirSync(http, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/lib.rs'), `pub mod http;\n`);
+    fs.writeFileSync(
+      path.join(http, 'mod.rs'),
+      `mod users;\nmod profiles;\npub fn api_router() {\n    users::router();\n    profiles::router();\n}\n`
+    );
+    fs.writeFileSync(path.join(http, 'users.rs'), `pub fn router() -> i32 { 1 }\n`);
+    fs.writeFileSync(path.join(http, 'profiles.rs'), `pub fn router() -> i32 { 2 }\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // Each submodule's same-named `router` fn must get mod.rs as a dependent —
+    // proving the bare prefix resolved self-relative AND disambiguated the
+    // colliding `router` name to the correct file (not an arbitrary one).
+    const routers = cg.getNodesByKind('function').filter((n) => n.name === 'router');
+    const usersRouter = routers.find((n) => n.filePath.endsWith('http/users.rs'));
+    const profilesRouter = routers.find((n) => n.filePath.endsWith('http/profiles.rs'));
+    expect(usersRouter, 'users.rs router fn').toBeDefined();
+    expect(profilesRouter, 'profiles.rs router fn').toBeDefined();
+    const usersDeps = [...cg.getImpactRadius(usersRouter!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    const profilesDeps = [...cg.getImpactRadius(profilesRouter!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(usersDeps.some((p) => p.endsWith('http/mod.rs')), 'users::router() lands on users.rs').toBe(true);
+    expect(profilesDeps.some((p) => p.endsWith('http/mod.rs')), 'profiles::router() lands on profiles.rs').toBe(true);
+  });
+});
+
 describe('Objective-C messages, class receivers, and #import', () => {
   let tempDir: string;
   let cg: CodeGraph;

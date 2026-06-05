@@ -1485,39 +1485,48 @@ function resolveRustModuleFile(
   const fromAbs = path.join(projectRoot, fromFile);
   const toRel = (p: string) => path.relative(projectRoot, p).replace(/\\/g, '/');
 
-  let dir: string | null;
-  let rest: string[];
+  // Walk a sequence of module segments down from `startDir`, mapping each to a
+  // `<seg>.rs` or `<seg>/mod.rs` file. Returns the leaf module's file, or null
+  // if `startDir` is null or any segment has no file on disk.
+  const resolveUnder = (startDir: string | null, rest: string[]): string | null => {
+    if (!startDir) return null;
+    let dir = startDir;
+    let targetFile: string | null = null;
+    for (const seg of rest) {
+      if (seg === 'self' || seg === 'crate' || seg === 'super') continue;
+      const asFile = toRel(path.join(dir, seg + '.rs'));
+      const asMod = toRel(path.join(dir, seg, 'mod.rs'));
+      if (context.fileExists(asFile)) targetFile = asFile;
+      else if (context.fileExists(asMod)) targetFile = asMod;
+      else return null;
+      dir = path.join(dir, seg);
+    }
+    return targetFile;
+  };
+
   const first = segments[0]!;
   if (first === 'crate') {
-    dir = rustCrateRootDir(fromAbs, context);
-    rest = segments.slice(1);
-  } else if (first === 'self') {
-    dir = rustSelfModuleDir(fromAbs);
-    rest = segments.slice(1);
-  } else if (first === 'super') {
+    return resolveUnder(rustCrateRootDir(fromAbs, context), segments.slice(1));
+  }
+  if (first === 'self') {
+    return resolveUnder(rustSelfModuleDir(fromAbs), segments.slice(1));
+  }
+  if (first === 'super') {
     let supers = 0;
     while (segments[supers] === 'super') supers++;
-    dir = rustSelfModuleDir(fromAbs);
-    for (let s = 0; s < supers; s++) dir = path.dirname(dir);
-    rest = segments.slice(supers);
-  } else {
-    // Bare path (2018 edition treats it as crate-relative).
-    dir = rustCrateRootDir(fromAbs, context);
-    rest = segments;
+    let dir: string | null = rustSelfModuleDir(fromAbs);
+    for (let s = 0; s < supers && dir; s++) dir = path.dirname(dir);
+    return resolveUnder(dir, segments.slice(supers));
   }
-  if (!dir) return null;
-
-  let targetFile: string | null = null;
-  for (const seg of rest) {
-    if (seg === 'self' || seg === 'crate' || seg === 'super') continue;
-    const asFile = toRel(path.join(dir, seg + '.rs'));
-    const asMod = toRel(path.join(dir, seg, 'mod.rs'));
-    if (context.fileExists(asFile)) targetFile = asFile;
-    else if (context.fileExists(asMod)) targetFile = asMod;
-    else return null;
-    dir = path.join(dir, seg);
-  }
-  return targetFile;
+  // Bare path. In expression position (`submodule::item()` — the router-assembly
+  // and general cross-module-call pattern) the prefix is a SUBMODULE of the
+  // current module, i.e. 2018 `self::`-relative — so try self-relative FIRST.
+  // Fall back to crate-relative for 2015-edition / crate-root items. External
+  // crate paths (`serde::de::Error`) miss both and fall through to name-matching.
+  return (
+    resolveUnder(rustSelfModuleDir(fromAbs), segments) ??
+    resolveUnder(rustCrateRootDir(fromAbs, context), segments)
+  );
 }
 
 /**
