@@ -12,7 +12,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - `codegraph status --json` now also reports the running CLI `version`, the index directory (`indexPath`), and a `lastIndexed` timestamp (ISO-8601, or null when nothing's indexed yet), so CI and scripts can pin the CLI version and check index freshness from a single command. A matching `CodeGraph.getLastIndexedAt()` library method exposes the same freshness check without shelling out. Thanks @12122J and @eddieran. (#329)
-- GDScript `.gd` files are now indexed in a first-version integration: CodeGraph recognizes them as a supported source language, parses them through a vendored tree-sitter grammar, extracts script symbols (`class_name`, `func`, `var`, `const`, `enum`), ordinary calls, and conservative static script-path dependencies from `load()`, `preload()`, and path-based `extends`. This first version intentionally does not model Godot scene/resource files (`.tscn`, `.tres`), signals, scene-tree relationships, autoloads, or NodePath-based runtime lookups.
+- GDScript support has been extended to a second stage: CodeGraph now preserves statically visible Godot script declarations such as `signal`, `@export`, `@onready`, and `static func`, emits typed `class_name` reference signals (including `Foo.new()` instantiations), and keeps class-name-based scripts scoped strongly enough for project navigation.
+- Godot `.tscn` scene files now participate in minimal project-level static linking: CodeGraph indexes scene files as graph entries, records serialized `ext_resource` paths, resolves static scene-to-script bindings and inherited/instanced scene links through normalized project-relative paths, and makes those scene entry points queryable alongside `.gd` scripts. This support still intentionally excludes NodePath resolution, runtime scene-tree semantics, autoload wiring, and signal-connect execution flow.
 
 ### Fixes
 

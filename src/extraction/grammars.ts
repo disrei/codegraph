@@ -10,7 +10,7 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'yaml' | 'twig' | 'xml' | 'properties' | 'godotscene' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -101,6 +101,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.lua': 'lua',
   '.luau': 'luau',
   '.gd': 'gdscript',
+  '.tscn': 'godotscene',
   '.m': 'objc',
   '.mm': 'objc',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
@@ -284,6 +285,7 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'twig') return true; // file-level tracking only
   if (language === 'xml') return true; // MyBatis mapper extractor
   if (language === 'properties') return true; // Spring config keys
+  if (language === 'godotscene') return true; // Godot scene text extractor
   if (language === 'unknown') return false;
   return language in WASM_GRAMMAR_FILES;
 }
@@ -294,7 +296,7 @@ export function isLanguageSupported(language: Language): boolean {
 export function isGrammarLoaded(language: Language): boolean {
   if (language === 'svelte' || language === 'vue' || language === 'liquid') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
-  if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
+  if (language === 'xml' || language === 'properties' || language === 'godotscene') return true; // no WASM grammar needed
   return languageCache.has(language);
 }
 
@@ -315,7 +317,7 @@ export function isFileLevelOnlyLanguage(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid', 'godotscene'];
 }
 
 /**
@@ -386,6 +388,7 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     gdscript: 'GDScript',
+    godotscene: 'Godot Scene',
     objc: 'Objective-C',
     yaml: 'YAML',
     twig: 'Twig',

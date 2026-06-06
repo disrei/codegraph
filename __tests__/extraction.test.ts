@@ -4299,11 +4299,14 @@ describe('GDScript Extraction', () => {
     it('should detect GDScript files', () => {
       expect(detectLanguage('player.gd')).toBe('gdscript');
       expect(detectLanguage('scripts/enemy.gd')).toBe('gdscript');
+      expect(detectLanguage('scenes/main.tscn')).toBe('godotscene');
     });
 
     it('should report GDScript as supported', () => {
       expect(isLanguageSupported('gdscript')).toBe(true);
       expect(getSupportedLanguages()).toContain('gdscript');
+      expect(isLanguageSupported('godotscene')).toBe(true);
+      expect(getSupportedLanguages()).toContain('godotscene');
     });
   });
 
@@ -4346,8 +4349,8 @@ func init_player():
     expect(enumMembers).toContain('RUNNING');
 
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'DEFAULT_SPEED')).toBe(true);
-    expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'state')).toBe(true);
-    expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'weapon')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'field' && n.name === 'state' && n.qualifiedName === 'PlayerController::state')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'field' && n.name === 'weapon' && n.qualifiedName === 'PlayerController::weapon')).toBe(true);
 
     const importRefs = result.unresolvedReferences
       .filter((r) => r.referenceKind === 'imports')
@@ -4368,6 +4371,198 @@ func init_player():
       .map((r) => r.referenceName);
     expect(calls).toContain('init_player');
     expect(calls).toContain('equip');
+  });
+
+  it('should preserve second-stage Godot declarations and class_name references', () => {
+    const code = `
+extends CharacterBody2D
+class_name PlayerController
+
+signal damaged(amount: int)
+@export var weapon: WeaponData
+@onready var sprite: Sprite2D = $Sprite2D
+
+static func build(data: WeaponData) -> PlayerController:
+    return PlayerController.new()
+
+func equip(target: Enemy, scene: PackedScene) -> void:
+    var controller: PlayerController = PlayerController.new()
+`;
+
+    const result = extractFromSource('player.gd', code);
+
+    const signal = result.nodes.find((n) => n.kind === 'property' && n.name === 'damaged');
+    expect(signal?.qualifiedName).toBe('PlayerController::damaged');
+    expect(signal?.signature).toBe('signal(amount: int)');
+
+    const exported = result.nodes.find((n) => n.kind === 'property' && n.name === 'weapon');
+    expect(exported?.qualifiedName).toBe('PlayerController::weapon');
+    expect(exported?.decorators).toContain('export');
+    expect(exported?.signature).toBe('WeaponData weapon');
+
+    const onready = result.nodes.find((n) => n.kind === 'field' && n.name === 'sprite');
+    expect(onready?.qualifiedName).toBe('PlayerController::sprite');
+    expect(onready?.decorators).toContain('onready');
+    expect(onready?.signature).toContain('Sprite2D sprite');
+
+    const build = result.nodes.find((n) => n.kind === 'method' && n.name === 'build');
+    expect(build?.qualifiedName).toBe('PlayerController::build');
+    expect(build?.isStatic).toBe(true);
+
+    const refs = result.unresolvedReferences;
+    expect(refs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ referenceKind: 'extends', referenceName: 'CharacterBody2D' }),
+      expect.objectContaining({ referenceKind: 'references', referenceName: 'WeaponData' }),
+      expect.objectContaining({ referenceKind: 'references', referenceName: 'Enemy' }),
+      expect.objectContaining({ referenceKind: 'references', referenceName: 'PackedScene' }),
+      expect.objectContaining({ referenceKind: 'references', referenceName: 'PlayerController' }),
+      expect.objectContaining({ referenceKind: 'instantiates', referenceName: 'PlayerController' }),
+    ]));
+  });
+
+  it('should extract minimal Godot scene links for scripts, scenes, and resources', () => {
+    const scene = `
+[gd_scene load_steps=4 format=3 uid="uid://root"]
+
+[ext_resource type="Script" path="res://scripts/player.gd" id="1_script"]
+[ext_resource type="PackedScene" path="res://scenes/enemy.tscn" id="2_enemy"]
+[ext_resource type="Texture2D" path="res://art/player.png" id="3_texture"]
+
+[node name="Main" type="Node2D"]
+script = ExtResource("1_script")
+
+[node name="Enemy" parent="." instance=ExtResource("2_enemy")]
+
+[node name="Sprite2D" type="Sprite2D" parent="."]
+texture = ExtResource("3_texture")
+`;
+
+    const result = extractFromSource('scenes/main.tscn', scene);
+
+    expect(result.nodes.some((n) => n.kind === 'file' && n.language === 'godotscene')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'main' && n.language === 'godotscene')).toBe(true);
+
+    const refs = result.unresolvedReferences;
+    expect(refs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ referenceKind: 'references', referenceName: 'scripts/player.gd' }),
+      expect.objectContaining({ referenceKind: 'references', referenceName: 'scenes/enemy.tscn' }),
+      expect.objectContaining({ referenceKind: 'references', referenceName: 'art/player.png' }),
+      expect.objectContaining({ referenceKind: 'imports', referenceName: 'scripts/player.gd' }),
+      expect.objectContaining({ referenceKind: 'imports', referenceName: 'scenes/enemy.tscn' }),
+    ]));
+  });
+
+  it('should resolve scene script imports to the correct same-named file after res path normalization', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'scripts', 'ui'), { recursive: true });
+      fs.mkdirSync(path.join(dir, 'scripts', 'world'), { recursive: true });
+      fs.mkdirSync(path.join(dir, 'scenes'), { recursive: true });
+
+      fs.writeFileSync(
+        path.join(dir, 'scripts', 'ui', 'player.gd'),
+        'class_name UiPlayer\nfunc ping():\n    pass\n'
+      );
+      fs.writeFileSync(
+        path.join(dir, 'scripts', 'world', 'player.gd'),
+        'class_name WorldPlayer\nfunc ping():\n    pass\n'
+      );
+      fs.writeFileSync(
+        path.join(dir, 'scenes', 'main.tscn'),
+        '[gd_scene load_steps=2 format=3]\n\n' +
+          '[ext_resource type="Script" path="res://scripts/ui/player.gd" id="1_script"]\n\n' +
+          '[node name="Main" type="Node2D"]\n' +
+          'script = ExtResource("1_script")\n'
+      );
+
+      const cg = CodeGraph.initSync(dir);
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      const scene = cg.getNodesByKind('component').find((n) => n.language === 'godotscene' && n.filePath === 'scenes/main.tscn');
+      expect(scene).toBeDefined();
+
+      const targetFile = cg.getNodesInFile('scripts/ui/player.gd').find((n) => n.kind === 'file');
+      const wrongFile = cg.getNodesInFile('scripts/world/player.gd').find((n) => n.kind === 'file');
+      expect(targetFile).toBeDefined();
+      expect(wrongFile).toBeDefined();
+
+      const imports = cg.getOutgoingEdges(scene!.id).filter((e) => e.kind === 'imports');
+      expect(imports.some((e) => e.target === targetFile!.id)).toBe(true);
+      expect(imports.some((e) => e.target === wrongFile!.id)).toBe(false);
+
+      cg.close();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('should index a minimal Godot project end-to-end across scene, script, and class-name references', async () => {
+    const dir = createTempDir();
+    let cg: CodeGraph | null = null;
+    try {
+      fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+      fs.mkdirSync(path.join(dir, 'scenes'), { recursive: true });
+
+      fs.writeFileSync(
+        path.join(dir, 'scripts', 'enemy.gd'),
+        'class_name Enemy\n\nfunc attack() -> void:\n    pass\n'
+      );
+      fs.writeFileSync(
+        path.join(dir, 'scripts', 'player.gd'),
+        'class_name PlayerController\n\n' +
+          'func spawn_enemy() -> Enemy:\n' +
+          '    return Enemy.new()\n'
+      );
+      fs.writeFileSync(
+        path.join(dir, 'scenes', 'main.tscn'),
+        '[gd_scene load_steps=2 format=3]\n\n' +
+          '[ext_resource type="Script" path="res://scripts/player.gd" id="1_script"]\n\n' +
+          '[node name="Main" type="Node2D"]\n' +
+          'script = ExtResource("1_script")\n'
+      );
+
+      cg = CodeGraph.initSync(dir);
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      const sceneComponent = cg.getNodesByKind('component').find(
+        (n) => n.language === 'godotscene' && n.filePath === 'scenes/main.tscn'
+      );
+      expect(sceneComponent).toBeDefined();
+
+      const sceneFile = cg.getNodesInFile('scenes/main.tscn').find((n) => n.kind === 'file');
+      expect(sceneFile).toBeDefined();
+
+      const playerFile = cg.getNodesInFile('scripts/player.gd').find((n) => n.kind === 'file');
+      const playerClass = cg.getNodesByKind('class').find((n) => n.name === 'PlayerController');
+      const spawnEnemy = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'PlayerController::spawn_enemy');
+      const enemyClass = cg.getNodesByKind('class').find((n) => n.name === 'Enemy');
+      expect(playerFile).toBeDefined();
+      expect(playerClass).toBeDefined();
+      expect(spawnEnemy).toBeDefined();
+      expect(enemyClass).toBeDefined();
+
+      const sceneImports = cg.getOutgoingEdges(sceneComponent!.id).filter((e) => e.kind === 'imports');
+      expect(sceneImports.some((e) => e.target === playerFile!.id)).toBe(true);
+
+      const spawnRefs = cg.getOutgoingEdges(spawnEnemy!.id);
+      expect(spawnRefs.some((e) => e.kind === 'instantiates' && e.target === enemyClass!.id)).toBe(true);
+
+      cg.close();
+      cg = null;
+    } finally {
+      try {
+        cg?.close();
+      } catch {
+        // best-effort cleanup for Windows file-handle timing
+      }
+      try {
+        cleanupTempDir(dir);
+      } catch {
+        // Windows can briefly hold SQLite handles after close; leave temp cleanup best-effort.
+      }
+    }
   });
 });
 

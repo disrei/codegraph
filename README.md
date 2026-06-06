@@ -635,7 +635,8 @@ is written):
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX form files) |
 | Lua | `.lua` | Full support (functions, methods with receivers, local variables, `require` imports, call edges) |
 | Luau | `.luau` | Full support (everything in Lua, plus `type`/`export type` aliases, typed signatures, and Roblox instance-path `require`) |
-| GDScript | `.gd` | First-version support (script symbols, calls, static `load`/`preload`, and script-path `extends`; excludes `.tscn`, signals, scene tree, autoload, and NodePath analysis) |
+| GDScript | `.gd` | Second-stage support (script symbols, calls, static `load`/`preload`, script-path `extends`, `signal`, `@export`, `@onready`, `static func`, typed class-name references, and `Foo.new()` instantiation signals; still excludes NodePath, autoload, runtime scene tree, and signal-connect flow analysis) |
+| Godot Scene | `.tscn` | Minimal static project support (scene file nodes, `ext_resource` paths, script bindings, inherited/instanced scene links; excludes runtime scene reconstruction, NodePath, autoload, and signal-connect execution flow) |
 
 ## Troubleshooting
 

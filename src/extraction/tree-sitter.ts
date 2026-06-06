@@ -24,6 +24,7 @@ import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { GodotSceneExtractor } from './godot-scene-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -1398,11 +1399,14 @@ export class TreeSitterExtractor {
         const name = getNodeText(nameNode, this.source);
         const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
-        this.createNode(kind, name, nameNode, {
+        const varNode = this.createNode(kind, name, nameNode, {
           docstring,
           signature: initSignature,
           isExported,
         });
+        if (varNode) {
+          this.extractVariableTypeAnnotation(node, varNode.id);
+        }
       }
     } else {
       // Generic fallback for other languages
@@ -2567,7 +2571,7 @@ export class TreeSitterExtractor {
    * Languages that support type annotations (TypeScript, etc.)
    */
   private readonly TYPE_ANNOTATION_LANGUAGES = new Set([
-    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp',
+    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp', 'gdscript',
   ]);
 
   /**
@@ -2584,6 +2588,8 @@ export class TreeSitterExtractor {
     // Go
     'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64',
     'float32', 'float64', 'complex64', 'complex128', 'rune', 'error',
+    // GDScript / Godot builtins
+    'String', 'StringName', 'Variant', 'Array', 'Dictionary', 'Callable', 'Signal', 'NodePath',
   ]);
 
   /**
@@ -2602,6 +2608,11 @@ export class TreeSitterExtractor {
     // parameter NAMES never accidentally surface as type refs (#381).
     if (this.language === 'csharp') {
       this.extractCsharpTypeRefs(node, nodeId);
+      return;
+    }
+
+    if (this.language === 'gdscript') {
+      this.extractGdscriptTypeRefs(node, nodeId);
       return;
     }
 
@@ -2739,6 +2750,11 @@ export class TreeSitterExtractor {
   private extractVariableTypeAnnotation(node: SyntaxNode, nodeId: string): void {
     if (!this.TYPE_ANNOTATION_LANGUAGES.has(this.language)) return;
 
+    if (this.language === 'gdscript') {
+      this.extractGdscriptTypeRefs(node, nodeId);
+      return;
+    }
+
     // Find type_annotation child (covers TS `: Type`, Rust `: Type`, etc.)
     const typeAnnotation = node.namedChildren.find(
       (c: SyntaxNode) => c.type === 'type_annotation'
@@ -2773,6 +2789,42 @@ export class TreeSitterExtractor {
       if (child) {
         this.extractTypeRefsFromSubtree(child, fromNodeId);
       }
+    }
+  }
+
+  private extractGdscriptTypeRefs(node: SyntaxNode, nodeId: string): void {
+    const directType = getChildByField(node, 'type');
+    if (directType) this.walkGdscriptTypePosition(directType, nodeId);
+
+    const params = getChildByField(node, 'parameters');
+    if (!params) return;
+
+    for (let i = 0; i < params.namedChildCount; i++) {
+      const child = params.namedChild(i);
+      if (!child || child.type !== 'typed_parameter') continue;
+      const typeNode = getChildByField(child, 'type');
+      if (typeNode) this.walkGdscriptTypePosition(typeNode, nodeId);
+    }
+  }
+
+  private walkGdscriptTypePosition(node: SyntaxNode, fromNodeId: string): void {
+    if (node.type === 'identifier') {
+      const name = getNodeText(node, this.source).trim();
+      if (name && !this.BUILTIN_TYPES.has(name)) {
+        this.unresolvedReferences.push({
+          fromNodeId,
+          referenceName: name,
+          referenceKind: 'references',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) this.walkGdscriptTypePosition(child, fromNodeId);
     }
   }
 
@@ -3217,6 +3269,9 @@ export function extractFromSource(
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
     // file node so the watcher tracks it without emitting symbols.
     const extractor = new MyBatisExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'godotscene') {
+    const extractor = new GodotSceneExtractor(filePath, source);
     result = extractor.extract();
   } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
     // No symbol extraction at this stage — files are tracked at the file-record
