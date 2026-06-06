@@ -1391,6 +1391,19 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, name, nameNode, { docstring, signature: initSignature, isExported });
       });
+    } else if (this.language === 'gdscript') {
+      const nameNode = getChildByField(node, 'name');
+      const valueNode = getChildByField(node, 'value');
+      if (nameNode) {
+        const name = getNodeText(nameNode, this.source);
+        const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
+        const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+        this.createNode(kind, name, nameNode, {
+          docstring,
+          signature: initSignature,
+          isExported,
+        });
+      }
     } else {
       // Generic fallback for other languages
       // Try to find identifier children
@@ -2110,6 +2123,16 @@ export class TreeSitterExtractor {
 
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
       const nodeType = node.type;
+
+      // Let language hooks claim special body-level constructs before the generic
+      // call/structure walker runs. This is required for languages where module
+      // loading is encoded as a call (`require`, `load`, `preload`) rather than a
+      // dedicated import node.
+      if (this.extractor?.visitNode) {
+        const ctx = this.makeExtractorContext();
+        const handled = this.extractor.visitNode(node, ctx);
+        if (handled) return;
+      }
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);

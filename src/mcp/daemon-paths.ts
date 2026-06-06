@@ -56,6 +56,7 @@ export function getDaemonPidPath(projectRoot: string): string {
 export interface DaemonLockInfo {
   pid: number;
   version: string;
+  buildIdentity: string;
   socketPath: string;
   startedAt: number;
 }
@@ -82,10 +83,26 @@ export function decodeLockInfo(raw: string): DaemonLockInfo | null {
       parsed &&
       typeof parsed.pid === 'number' &&
       typeof parsed.version === 'string' &&
+      typeof parsed.buildIdentity === 'string' &&
       typeof parsed.socketPath === 'string' &&
       typeof parsed.startedAt === 'number'
     ) {
       return parsed as DaemonLockInfo;
+    }
+    if (
+      parsed &&
+      typeof parsed.pid === 'number' &&
+      typeof parsed.version === 'string' &&
+      typeof parsed.socketPath === 'string' &&
+      typeof parsed.startedAt === 'number'
+    ) {
+      return {
+        pid: parsed.pid,
+        version: parsed.version,
+        buildIdentity: 'legacy',
+        socketPath: parsed.socketPath,
+        startedAt: parsed.startedAt,
+      };
     }
     return null;
   } catch {
@@ -93,7 +110,7 @@ export function decodeLockInfo(raw: string): DaemonLockInfo | null {
   }
   const pid = Number(trimmed);
   if (Number.isFinite(pid) && pid > 0) {
-    return { pid, version: 'unknown', socketPath: '', startedAt: 0 };
+    return { pid, version: 'unknown', buildIdentity: 'unknown', socketPath: '', startedAt: 0 };
   }
   return null;
 }

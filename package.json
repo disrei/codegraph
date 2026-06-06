@@ -21,6 +21,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:eval": "vitest run __tests__/evaluation/",
+    "test:gdscript-mcp": "vitest run __tests__/extraction.test.ts -t GDScript && vitest run __tests__/mcp-daemon.test.ts",
     "eval": "npm run build && npx tsx __tests__/evaluation/runner.ts",
     "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\""
   },

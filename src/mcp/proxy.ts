@@ -22,7 +22,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 import { DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
-import { CodeGraphPackageVersion } from './version';
+import { CodeGraphBuildIdentity, CodeGraphPackageVersion } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
@@ -41,6 +41,8 @@ export interface ProxyResult {
   outcome: 'proxied' | 'fallback-needed';
   reason?: string;
 }
+
+type HelloConnectResult = net.Socket | 'version-mismatch' | 'upgrade-needed' | null;
 
 /**
  * Attempt to connect to the daemon at `socketPath` and pipe stdio through it.
@@ -88,6 +90,15 @@ export async function runProxy(
     return { outcome: 'fallback-needed', reason: 'version mismatch' };
   }
 
+  if (hello.buildIdentity !== CodeGraphBuildIdentity) {
+    process.stderr.write(
+      `[CodeGraph MCP] Found a daemon on ${socketPath} with a different build identity ` +
+      `(${hello.buildIdentity} vs ${CodeGraphBuildIdentity}); falling back to direct mode.\n`
+    );
+    socket.destroy();
+    return { outcome: 'fallback-needed', reason: 'build mismatch' };
+  }
+
   process.stderr.write(
     `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
   );
@@ -109,7 +120,7 @@ export async function runProxy(
 export async function connectWithHello(
   socketPath: string,
   expectedVersion: string = CodeGraphPackageVersion,
-): Promise<net.Socket | 'version-mismatch' | null> {
+): Promise<HelloConnectResult> {
   if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
   const socket = net.createConnection(socketPath);
   socket.setEncoding('utf8');
@@ -127,6 +138,15 @@ export async function connectWithHello(
     );
     socket.destroy();
     return 'version-mismatch';
+  }
+  const helloBuildIdentity = typeof hello.buildIdentity === 'string' ? hello.buildIdentity : 'legacy';
+  if (helloBuildIdentity !== CodeGraphBuildIdentity) {
+    process.stderr.write(
+      `[CodeGraph MCP] Found a daemon on ${socketPath} with an incompatible build identity ` +
+      `(${helloBuildIdentity} vs ${CodeGraphBuildIdentity}); attempting daemon takeover.\n`
+    );
+    socket.destroy();
+    return 'upgrade-needed';
   }
   process.stderr.write(
     `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
@@ -334,12 +354,18 @@ function readHelloLine(socket: net.Socket): Promise<DaemonHello> {
         socket.unshift(tail);
       }
       try {
-        const parsed = JSON.parse(line) as DaemonHello;
+        const parsed = JSON.parse(line) as Partial<DaemonHello>;
         if (typeof parsed.codegraph !== 'string' || typeof parsed.pid !== 'number') {
           reject(new Error('daemon hello missing required fields'));
           return;
         }
-        resolve(parsed);
+        resolve({
+          codegraph: parsed.codegraph,
+          buildIdentity: typeof parsed.buildIdentity === 'string' ? parsed.buildIdentity : 'legacy',
+          pid: parsed.pid,
+          socketPath: typeof parsed.socketPath === 'string' ? parsed.socketPath : '',
+          protocol: 1,
+        });
       } catch (err) {
         reject(new Error(`daemon hello not JSON: ${err instanceof Error ? err.message : String(err)}`));
       }

@@ -44,6 +44,7 @@ import { MCPSession } from './session';
 import {
   Daemon,
   clearStaleDaemonLock,
+  daemonBuildMatches,
   isProcessAlive,
   tryAcquireDaemonLock,
 } from './daemon';
@@ -363,6 +364,14 @@ export class MCPServer {
       // binding) — we're redundant; exit cleanly so the launcher proxies to it.
       const existing = lock.existing;
       if (existing && existing.pid > 0 && isProcessAlive(existing.pid)) {
+        if (!daemonBuildMatches(existing)) {
+          process.stderr.write(
+            `[CodeGraph daemon] Replacing incompatible daemon (pid ${existing.pid}, v${existing.version}, build ${existing.buildIdentity}).\n`
+          );
+          try { process.kill(existing.pid, 'SIGTERM'); } catch { /* race */ }
+          await sleep(TAKEOVER_RETRY_DELAY_MS);
+          continue;
+        }
         process.stderr.write(
           `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
         );
@@ -393,13 +402,16 @@ export class MCPServer {
       // Fast path: a daemon may already be listening.
       const probe = await connectWithHello(socketPath);
       if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
-      if (probe) return probe;
-      // None reachable — spawn one (detached) and poll for its bind.
-      spawnDetachedDaemon(root);
+      if (probe === 'upgrade-needed' || probe === null) {
+        spawnDetachedDaemon(root);
+      }
+      if (probe && probe !== 'upgrade-needed') return probe;
+      // None reachable (or an upgrade is needed) — poll for the replacement daemon.
       for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
         await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
         const s = await connectWithHello(socketPath);
         if (s === 'version-mismatch') return null;
+        if (s === 'upgrade-needed') continue;
         if (s) return s;
       }
       return null; // never bound — the proxy serves this session in-process

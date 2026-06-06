@@ -93,6 +93,11 @@ describe('Language Detection', () => {
     expect(detectLanguage('main.dart')).toBe('dart');
   });
 
+  it('should detect GDScript files', () => {
+    expect(detectLanguage('player.gd')).toBe('gdscript');
+    expect(detectLanguage('scripts/enemy.gd')).toBe('gdscript');
+  });
+
   it('should detect Objective-C files', () => {
     expect(detectLanguage('AppDelegate.m')).toBe('objc');
     expect(detectLanguage('ViewController.mm')).toBe('objc');
@@ -4282,6 +4287,87 @@ local count = 0
       const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
       expect(vars).toContain('count');
     });
+  });
+});
+
+// =============================================================================
+// GDScript
+// =============================================================================
+
+describe('GDScript Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect GDScript files', () => {
+      expect(detectLanguage('player.gd')).toBe('gdscript');
+      expect(detectLanguage('scripts/enemy.gd')).toBe('gdscript');
+    });
+
+    it('should report GDScript as supported', () => {
+      expect(isLanguageSupported('gdscript')).toBe(true);
+      expect(getSupportedLanguages()).toContain('gdscript');
+    });
+  });
+
+  it('should extract class, methods, enum members, constants, variables, imports, and calls', () => {
+    const code = `
+extends "res://base_controller.gd"
+class_name PlayerController
+
+enum State { IDLE, RUNNING }
+const DEFAULT_SPEED = 120
+var state = State.IDLE
+var weapon = preload("res://weapons/sword.gd")
+
+func _ready():
+    init_player()
+    var hud = load("res://ui/hud.gd")
+    equip(weapon)
+
+func init_player():
+    state = State.RUNNING
+`;
+
+    const result = extractFromSource('player.gd', code);
+
+    const playerClass = result.nodes.find((n) => n.kind === 'class' && n.name === 'PlayerController');
+    const readyMethod = result.nodes.find((n) => n.kind === 'method' && n.name === '_ready');
+    expect(playerClass).toBeDefined();
+    expect(readyMethod).toBeDefined();
+    expect(playerClass!.startLine).toBeLessThanOrEqual(readyMethod!.startLine);
+    expect(playerClass!.endLine).toBeGreaterThanOrEqual(readyMethod!.endLine);
+
+    const methods = result.nodes.filter((n) => n.kind === 'method');
+    expect(methods.some((m) => m.name === '_ready' && m.qualifiedName === 'PlayerController::_ready')).toBe(true);
+    expect(methods.some((m) => m.name === 'init_player' && m.qualifiedName === 'PlayerController::init_player')).toBe(true);
+
+    const enumNode = result.nodes.find((n) => n.kind === 'enum' && n.name === 'State');
+    expect(enumNode).toBeDefined();
+    const enumMembers = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+    expect(enumMembers).toContain('IDLE');
+    expect(enumMembers).toContain('RUNNING');
+
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'DEFAULT_SPEED')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'state')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'weapon')).toBe(true);
+
+    const importRefs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    const extendsRefs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'extends')
+      .map((r) => r.referenceName);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(importRefs).toContain('res://base_controller.gd');
+    expect(importRefs).toContain('res://weapons/sword.gd');
+    expect(importRefs).toContain('res://ui/hud.gd');
+    expect(extendsRefs).toContain('res://base_controller.gd');
+    expect(imports).toContain('res://weapons/sword.gd');
+    expect(result.nodes.some((n) => n.kind === 'import' && n.qualifiedName === '_ready::res://ui/hud.gd')).toBe(false);
+
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toContain('init_player');
+    expect(calls).toContain('equip');
   });
 });
 

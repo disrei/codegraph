@@ -17,6 +17,7 @@
  */
 
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 import * as path from 'path';
 
 function readPackageVersion(): string {
@@ -33,4 +34,40 @@ function readPackageVersion(): string {
   return '0.0.0-unknown';
 }
 
+function packageRoot(): string {
+  return path.join(__dirname, '..', '..');
+}
+
+function readBuildIdentity(): string {
+  const root = packageRoot();
+  const hash = crypto.createHash('sha256');
+  hash.update(fs.realpathSync.native?.(root) ?? fs.realpathSync(root));
+
+  const candidates = [
+    path.join(root, 'package.json'),
+    path.join(root, 'dist', 'index.js'),
+    path.join(root, 'dist', 'mcp', 'index.js'),
+    path.join(root, 'dist', 'extraction', 'grammars.js'),
+    path.join(root, 'dist', 'extraction', 'languages', 'gdscript.js'),
+    path.join(root, 'src', 'index.ts'),
+    path.join(root, 'src', 'mcp', 'index.ts'),
+    path.join(root, 'src', 'extraction', 'grammars.ts'),
+    path.join(root, 'src', 'extraction', 'languages', 'gdscript.ts'),
+  ];
+
+  for (const file of candidates) {
+    try {
+      const stat = fs.statSync(file);
+      hash.update(path.relative(root, file));
+      hash.update(String(stat.size));
+      hash.update(String(Math.floor(stat.mtimeMs)));
+    } catch {
+      // This file doesn't exist in the current runtime layout.
+    }
+  }
+
+  return hash.digest('hex').slice(0, 16);
+}
+
 export const CodeGraphPackageVersion = readPackageVersion();
+export const CodeGraphBuildIdentity = readBuildIdentity();

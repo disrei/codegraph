@@ -635,6 +635,7 @@ is written):
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX form files) |
 | Lua | `.lua` | Full support (functions, methods with receivers, local variables, `require` imports, call edges) |
 | Luau | `.luau` | Full support (everything in Lua, plus `type`/`export type` aliases, typed signatures, and Roblox instance-path `require`) |
+| GDScript | `.gd` | First-version support (script symbols, calls, static `load`/`preload`, and script-path `extends`; excludes `.tscn`, signals, scene tree, autoload, and NodePath analysis) |
 
 ## Troubleshooting
 

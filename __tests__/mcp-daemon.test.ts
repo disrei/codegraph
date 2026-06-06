@@ -33,12 +33,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import { ChildProcess, ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
-import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
+import { decodeLockInfo, getDaemonSocketPath } from '../src/mcp/daemon-paths';
+import { CodeGraphBuildIdentity, CodeGraphPackageVersion } from '../src/mcp/version';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -156,6 +157,25 @@ function killTree(...procs: ChildProcessWithoutNullStreams[]): void {
   for (const p of procs) {
     if (!p.killed) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
   }
+}
+
+async function spawnFakeLegacyDaemon(sockPath: string, hello: Record<string, unknown>, env: NodeJS.ProcessEnv = {}): Promise<ChildProcess> {
+  const script = [
+    "const net = require('net');",
+    "const sockPath = process.argv[1];",
+    "const hello = JSON.parse(process.argv[2]);",
+    "const server = net.createServer((sock) => { sock.write(JSON.stringify(hello) + '\\n'); });",
+    "process.on('SIGTERM', () => server.close(() => process.exit(0)));",
+    "server.listen(sockPath);",
+  ].join(' ');
+  const child = spawn(process.execPath, ['-e', script, sockPath, JSON.stringify(hello)], {
+    stdio: ['ignore', 'ignore', 'ignore'],
+    env: { ...process.env, ...env },
+  });
+  child.on('error', () => { /* ignore */ });
+  await waitFor(() => isAlive(child.pid ?? 0), 3000);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  return child;
 }
 
 async function waitProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
@@ -327,6 +347,23 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(isAlive(livePid!)).toBe(true);
   }, 40000);
 
+  it('decodeLockInfo accepts legacy json pidfiles', () => {
+    expect(
+      decodeLockInfo(JSON.stringify({
+        pid: 123,
+        version: CodeGraphPackageVersion,
+        socketPath: 'sock',
+        startedAt: 1,
+      })),
+    ).toEqual({
+      pid: 123,
+      version: CodeGraphPackageVersion,
+      buildIdentity: 'legacy',
+      socketPath: 'sock',
+      startedAt: 1,
+    });
+  });
+
   it('proxy falls back to direct mode on a daemon version mismatch', async () => {
     const net = await import('net');
     const sockPath = getDaemonSocketPath(realRoot);
@@ -334,10 +371,10 @@ describe('Shared MCP daemon (issue #411)', () => {
     // mini-server that answers with a mismatched-version hello.
     fs.writeFileSync(
       path.join(realRoot, '.codegraph', 'daemon.pid'),
-      JSON.stringify({ pid: process.pid, version: '0.0.0-mismatch', socketPath: sockPath, startedAt: Date.now() }),
+      JSON.stringify({ pid: process.pid, version: '0.0.0-mismatch', buildIdentity: CodeGraphBuildIdentity, socketPath: sockPath, startedAt: Date.now() }),
     );
     const miniServer = net.createServer((sock) => {
-      sock.write(JSON.stringify({ codegraph: '0.0.0-mismatch', pid: 1, socketPath: sockPath, protocol: 1 }) + '\n');
+      sock.write(JSON.stringify({ codegraph: '0.0.0-mismatch', buildIdentity: CodeGraphBuildIdentity, pid: 1, socketPath: sockPath, protocol: 1 }) + '\n');
     });
     await new Promise<void>((resolve) => miniServer.listen(sockPath, () => resolve()));
 
@@ -356,6 +393,88 @@ describe('Shared MCP daemon (issue #411)', () => {
       );
     } finally {
       await new Promise<void>((resolve) => miniServer.close(() => resolve()));
+    }
+  }, 30000);
+
+  it('proxy replaces a same-version but different-build daemon and re-attaches to the new daemon', async () => {
+    const sockPath = getDaemonSocketPath(realRoot);
+    const legacy = await spawnFakeLegacyDaemon(sockPath, {
+      codegraph: CodeGraphPackageVersion,
+      buildIdentity: 'different-build',
+      pid: 1,
+      socketPath: sockPath,
+      protocol: 1,
+    });
+    fs.writeFileSync(
+      path.join(realRoot, '.codegraph', 'daemon.pid'),
+      JSON.stringify({
+        pid: legacy.pid,
+        version: CodeGraphPackageVersion,
+        buildIdentity: 'different-build',
+        socketPath: sockPath,
+        startedAt: Date.now(),
+      }),
+    );
+
+    try {
+      const server = spawnServer(tempDir);
+      servers.push(server);
+      sendInitialize(server.child, `file://${tempDir}`, 1);
+      const resp = await waitFor(() => findResponse(server.stdout, 1), 10000);
+      expect(resp.result.serverInfo.name).toBe('codegraph');
+      await waitFor(
+        () => server.stderr.some((l) => l.includes('attempting daemon takeover')),
+        6000,
+      ).catch((e) => {
+        throw new Error(`${(e as Error).message}\nstderr:\n${server.stderr.join('\n')}\ndaemon.log:\n${readDaemonLog(realRoot)}`);
+      });
+      await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 10000);
+      await waitFor(() => countListeningLines(realRoot) >= 1, 10000);
+      expect(readLockPid(realRoot)).not.toBe(legacy.pid);
+    } finally {
+      if (legacy.pid && isAlive(legacy.pid)) {
+        try { process.kill(legacy.pid, 'SIGKILL'); } catch { /* ignore */ }
+      }
+    }
+  }, 30000);
+
+  it('proxy replaces a legacy json pidfile + legacy hello daemon and re-attaches to the new daemon', async () => {
+    const sockPath = getDaemonSocketPath(realRoot);
+    const legacy = await spawnFakeLegacyDaemon(sockPath, {
+      codegraph: CodeGraphPackageVersion,
+      pid: 1,
+      socketPath: sockPath,
+      protocol: 1,
+    });
+    fs.writeFileSync(
+      path.join(realRoot, '.codegraph', 'daemon.pid'),
+      JSON.stringify({
+        pid: legacy.pid,
+        version: CodeGraphPackageVersion,
+        socketPath: sockPath,
+        startedAt: Date.now(),
+      }),
+    );
+
+    try {
+      const server = spawnServer(tempDir);
+      servers.push(server);
+      sendInitialize(server.child, `file://${tempDir}`, 1);
+      const resp = await waitFor(() => findResponse(server.stdout, 1), 10000);
+      expect(resp.result.serverInfo.name).toBe('codegraph');
+      await waitFor(
+        () => server.stderr.some((l) => l.includes('attempting daemon takeover')),
+        6000,
+      ).catch((e) => {
+        throw new Error(`${(e as Error).message}\nstderr:\n${server.stderr.join('\n')}\ndaemon.log:\n${readDaemonLog(realRoot)}`);
+      });
+      await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 10000);
+      await waitFor(() => countListeningLines(realRoot) >= 1, 10000);
+      expect(readLockPid(realRoot)).not.toBe(legacy.pid);
+    } finally {
+      if (legacy.pid && isAlive(legacy.pid)) {
+        try { process.kill(legacy.pid, 'SIGKILL'); } catch { /* ignore */ }
+      }
     }
   }, 30000);
 

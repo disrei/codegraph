@@ -53,7 +53,7 @@ import {
   getDaemonPidPath,
   getDaemonSocketPath,
 } from './daemon-paths';
-import { CodeGraphPackageVersion } from './version';
+import { CodeGraphBuildIdentity, CodeGraphPackageVersion } from './version';
 
 /** Default idle linger after the last client disconnects. */
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
@@ -69,9 +69,14 @@ const MAX_HELLO_LINE_BYTES = 4096;
  */
 export interface DaemonHello {
   codegraph: string; // package version (must match the proxy's own version)
+  buildIdentity: string; // distinguishes same-version but different builds
   pid: number;       // daemon pid (informational; for `ps` debugging)
   socketPath: string; // echoed back so the proxy can log it
   protocol: 1;       // bump if the hello shape changes
+}
+
+export function daemonBuildMatches(info: Pick<DaemonLockInfo, 'version' | 'buildIdentity'> | null | undefined): boolean {
+  return !!info && info.version === CodeGraphPackageVersion && info.buildIdentity === CodeGraphBuildIdentity;
 }
 
 export interface DaemonStartResult {
@@ -149,6 +154,7 @@ export class Daemon {
     const lock: DaemonLockInfo = {
       pid: process.pid,
       version: CodeGraphPackageVersion,
+      buildIdentity: CodeGraphBuildIdentity,
       socketPath: this.socketPath,
       startedAt: Date.now(),
     };
@@ -208,6 +214,7 @@ export class Daemon {
     // application bytes. The proxy reads exactly one line, then forwards.
     const hello: DaemonHello = {
       codegraph: CodeGraphPackageVersion,
+      buildIdentity: CodeGraphBuildIdentity,
       pid: process.pid,
       socketPath: this.socketPath,
       protocol: 1,
@@ -308,6 +315,7 @@ export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
   const info: DaemonLockInfo = {
     pid: process.pid,
     version: CodeGraphPackageVersion,
+    buildIdentity: CodeGraphBuildIdentity,
     socketPath: getDaemonSocketPath(projectRoot),
     startedAt: Date.now(),
   };

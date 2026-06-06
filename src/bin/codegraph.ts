@@ -26,6 +26,8 @@ import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized } from '../directory';
+import { clearStaleDaemonLock, daemonBuildMatches, isProcessAlive } from '../mcp/daemon';
+import { decodeLockInfo, getDaemonPidPath } from '../mcp/daemon-paths';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -275,6 +277,43 @@ function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function stopConflictingDaemon(projectPath: string): Promise<void> {
+  const pidPath = getDaemonPidPath(projectPath);
+  if (!fs.existsSync(pidPath)) return;
+
+  let existing = null;
+  try {
+    existing = decodeLockInfo(fs.readFileSync(pidPath, 'utf8'));
+  } catch {
+    return;
+  }
+
+  if (!existing || daemonBuildMatches(existing)) return;
+
+  if (existing.pid <= 0 || !isProcessAlive(existing.pid)) {
+    clearStaleDaemonLock(pidPath, existing.pid);
+    return;
+  }
+
+  warn(`Stopping incompatible CodeGraph daemon (pid ${existing.pid}, v${existing.version}, build ${existing.buildIdentity})`);
+  try {
+    process.kill(existing.pid, 'SIGTERM');
+  } catch {
+    return;
+  }
+
+  for (let i = 0; i < 40; i++) {
+    if (!isProcessAlive(existing.pid)) break;
+    await sleep(100);
+  }
+
+  clearStaleDaemonLock(pidPath, existing.pid);
+}
+
 type IndexResult = {
   success: boolean;
   filesIndexed: number;
@@ -444,6 +483,7 @@ program
       // Indexing runs by default now. The legacy -i/--index flag is still
       // accepted (so existing muscle memory and scripts don't break) but is a
       // no-op — initializing always builds the initial index.
+      await stopConflictingDaemon(projectPath);
       let result: IndexResult;
       if (options.verbose) {
         result = await cg.indexAll({
@@ -547,6 +587,7 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
+      await stopConflictingDaemon(projectPath);
       const cg = await CodeGraph.open(projectPath);
 
       if (options.quiet) {
@@ -615,6 +656,7 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
+      await stopConflictingDaemon(projectPath);
       const cg = await CodeGraph.open(projectPath);
 
       if (options.quiet) {
